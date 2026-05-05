@@ -509,11 +509,15 @@ def expand_menu_if_needed():
 
 
 def apply_initial_filters():
-    for link in wait.until(EC.presence_of_all_elements_located((By.TAG_NAME, "a"))):
-        txt = (link.text or "").strip().lower()
-        if "divulgação" in txt and "portais" in txt:
-            safe_click(link)
-            break
+    divulgacao_link = wait.until(
+        EC.element_to_be_clickable(
+            (By.XPATH,
+             "//a[contains(normalize-space(.),'Divulgação') and contains(normalize-space(.),'Portais')]"
+             " | //a[contains(normalize-space(.),'Divulgacao') and contains(normalize-space(.),'Portais')]"
+             " | //a[contains(normalize-space(.),'divulga') and contains(normalize-space(.),'portai')]")
+        )
+    )
+    safe_click(divulgacao_link)
     time.sleep(1)
 
     wait.until(EC.element_to_be_clickable((By.XPATH, "//select[@data-input='idportal']"))).click()
