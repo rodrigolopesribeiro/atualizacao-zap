@@ -1158,14 +1158,25 @@ def wait_until_10am():
 def main():
     global driver, wait, actions
 
-    # Aguarda as 10:00 h antes de abrir o navegador
-    wait_until_10am()
+    em_nuvem = os.getenv("CI", "") == "true"
+
+    # Localmente aguarda as 10h; em nuvem o cron do GitHub Actions cuida do horário
+    if not em_nuvem:
+        wait_until_10am()
 
     options = Options()
-    options.add_argument("--start-maximized")
     options.add_argument("--disable-notifications")
     options.add_argument("--disable-popup-blocking")
     options.add_argument("--disable-gpu")
+
+    if em_nuvem:
+        # Modo headless para rodar em servidor Linux sem interface gráfica
+        options.add_argument("--headless=new")
+        options.add_argument("--no-sandbox")
+        options.add_argument("--disable-dev-shm-usage")
+        options.add_argument("--window-size=1920,1080")
+    else:
+        options.add_argument("--start-maximized")
 
     driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
     wait = WebDriverWait(driver, 30)
@@ -1237,8 +1248,8 @@ def main():
         print(f"\n⛔ Erro geral: {type(exc).__name__} | {repr(exc)}")
     finally:
         print("\n✅ Processo concluído.")
-        # Para fechar ao final, descomente:
-        # driver.quit()
+        if driver and (em_nuvem or os.getenv("FECHAR_BROWSER", "") == "1"):
+            driver.quit()
 
 
 if __name__ == "__main__":

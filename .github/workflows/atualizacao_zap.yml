@@ -1,0 +1,39 @@
+name: Atualização ZAP Imóveis
+
+on:
+  schedule:
+    # 10:00 BRT (UTC-3) — segunda a sexta
+    - cron: '0 13 * * 1-5'
+  workflow_dispatch:
+    # Permite disparar manualmente pelo GitHub (botão "Run workflow")
+
+jobs:
+  executar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 480  # até 8 horas (tempo da verificação no Canal Pro)
+
+    steps:
+      - name: Checkout do repositório
+        uses: actions/checkout@v4
+
+      - name: Configurar Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Instalar dependências Python
+        run: pip install -r requirements.txt
+
+      - name: Instalar Google Chrome
+        uses: browser-actions/setup-chrome@v1
+        with:
+          chrome-version: stable
+
+      - name: Executar script de atualização
+        env:
+          CI: "true"
+          CRM_USUARIO: ${{ secrets.CRM_USUARIO }}
+          CRM_SENHA: ${{ secrets.CRM_SENHA }}
+          CANALPRO_EMAIL: ${{ secrets.CANALPRO_EMAIL }}
+          CANALPRO_SENHA: ${{ secrets.CANALPRO_SENHA }}
+        run: python atualizacao_zap.py
