@@ -1115,31 +1115,21 @@ def _canal_pro_login():
         else:
             senha_field.send_keys(Keys.RETURN)
 
-        # PASSO 7 — Validar redirecionamento
-        print("⏳ Aguardando redirecionamento pós-login...")
-        try:
-            WebDriverWait(driver, 20).until(
-                lambda d: "performance/home" in d.current_url
-                or "listings" in d.current_url
-                or d.current_url != CANAL_PRO_URL_LOGIN
-            )
-        except Exception:
-            pass
+        # PASSO 7 — Detectar redirecionamento ou tela de 2FA
+        print("⏳ Aguardando resposta pós-login...")
+        status = _canal_pro_aguardar_pos_login()
 
+        if status == "2fa":
+            print("🔐 Detectada tela de 2FA (verificação em duas etapas).")
+            _canal_pro_handle_2fa()
+        elif status == "ok":
+            pass  # login direto, sem 2FA
+        else:
+            raise Exception("Login Canal Pro: timeout ou estado inesperado pós-submit.")
+
+        # Confirmação final
         current = driver.current_url
         if "/login" in current:
-            msgs = []
-            try:
-                erros = driver.find_elements(
-                    By.XPATH,
-                    "//*[contains(text(),'obrigatório') or contains(text(),'inválido')"
-                    " or contains(text(),'incorret') or contains(text(),'erro')]"
-                )
-                msgs = [e.text for e in erros if e.is_displayed() and e.text.strip()]
-            except Exception:
-                pass
-            if msgs:
-                print(f"   Mensagens de erro no formulário: {msgs}")
             raise Exception(f"Login no Canal Pro falhou — URL ainda em /login. URL atual: {current}")
 
         time.sleep(2)
@@ -1150,6 +1140,187 @@ def _canal_pro_login():
     except Exception as exc:
         print(f"⛔ Falha no login do Canal Pro: {type(exc).__name__} | {repr(exc)}")
         raise
+
+
+def _canal_pro_aguardar_pos_login():
+    """Aguarda redirecionamento pós-login OU detecta tela de 2FA. Retorna 'ok', '2fa' ou None."""
+    def _check(d):
+        url = d.current_url or ""
+        if "performance/home" in url or "listings" in url:
+            return "ok"
+        try:
+            body_text = d.find_element(By.TAG_NAME, "body").text or ""
+        except Exception:
+            return False
+        if "Acesso em um novo dispositivo" in body_text:
+            return "2fa"
+        if "informe o código" in body_text.lower():
+            return "2fa"
+        return False
+
+    try:
+        return WebDriverWait(driver, 15).until(_check)
+    except TimeoutException:
+        return None
+
+
+def _canal_pro_handle_2fa():
+    """
+    Trata autenticação em dois fatores do Canal Pro via pausa manual no terminal.
+    Depende de input() porque o código chega por e-mail e precisa de ação humana.
+    O Canal Pro exige 2FA quando detecta um 'novo dispositivo' (perfil Chrome sem
+    cookies persistentes da sessão anterior).
+    """
+    print("\n" + "=" * 60)
+    print("🔐 AUTENTICAÇÃO 2FA EXIGIDA PELO CANAL PRO")
+    print("=" * 60)
+    print("📧 Um código de 6 dígitos foi enviado para mkmarcoslopes@gmail.com")
+    print("⏰ Validade do código: 5 minutos")
+    print()
+    print("👉 Abra o Gmail, copie o código de 6 dígitos e cole abaixo.")
+    print()
+
+    while True:
+        codigo = input("➡️  Cole o código de 6 dígitos aqui: ").strip()
+        codigo_limpo = "".join(c for c in codigo if c.isdigit())
+        if len(codigo_limpo) == 6:
+            break
+        print(f"⚠️ Código inválido (recebi '{codigo}', extraí '{codigo_limpo}'). "
+              "Precisa ter exatamente 6 dígitos. Tente novamente.")
+
+    print(f"✅ Código recebido: {codigo_limpo}")
+
+    # PASSO 2 — Localizar os 6 campos do código
+    print("📝 Localizando os 6 campos do código...")
+    inputs = []
+    for locator in [
+        "input[maxlength='1']",
+        "input[type='tel'], input[type='number']",
+        "input[class*='otp'], input[class*='code'], input[class*='pin'], input[class*='digit']",
+    ]:
+        try:
+            found = driver.find_elements(By.CSS_SELECTOR, locator)
+            found = [el for el in found if el.is_displayed()]
+            if len(found) >= 6:
+                inputs = found[:6]
+                break
+        except Exception:
+            pass
+
+    if len(inputs) < 6:
+        # CAMADA D — container com texto relacionado ao código
+        try:
+            container = driver.find_element(
+                By.XPATH,
+                "//*[contains(normalize-space(.), 'informe o código') or "
+                "contains(normalize-space(.), 'Acesso em um novo dispositivo')]"
+                "/ancestor::div[3]"
+            )
+            found = container.find_elements(By.TAG_NAME, "input")
+            found = [el for el in found if el.is_displayed()]
+            if len(found) >= 6:
+                inputs = found[:6]
+        except Exception:
+            pass
+
+    if len(inputs) < 6:
+        html_parcial = driver.execute_script("return document.body.innerHTML.slice(0, 5000);")
+        print("⚠️ Não consegui localizar os 6 campos do código 2FA.")
+        print("HTML parcial para diagnóstico:")
+        print(html_parcial[:2000])
+        raise Exception("2FA: 6 campos de código não encontrados")
+
+    # PASSO 3 — Preencher os campos
+    print("📝 Preenchendo dígitos...")
+
+    # Tenta auto-tab: envia tudo pelo primeiro campo
+    preenchido = False
+    try:
+        inputs[0].click()
+        inputs[0].send_keys(codigo_limpo)
+        time.sleep(0.5)
+        valores = [(inp.get_attribute("value") or "").strip() for inp in inputs]
+        if "".join(valores) == codigo_limpo:
+            print("✅ Código preenchido via auto-tab.")
+            preenchido = True
+    except Exception:
+        pass
+
+    if not preenchido:
+        for i, digito in enumerate(codigo_limpo):
+            campo = inputs[i]
+            try:
+                campo.clear()
+            except Exception:
+                driver.execute_script("arguments[0].value = '';", campo)
+
+            try:
+                campo.send_keys(digito)
+                time.sleep(0.15)
+                if (campo.get_attribute("value") or "").strip() == digito:
+                    continue
+            except Exception:
+                pass
+
+            driver.execute_script(
+                "arguments[0].focus();"
+                "arguments[0].value = arguments[1];"
+                "arguments[0].dispatchEvent(new Event('input', {bubbles: true}));"
+                "arguments[0].dispatchEvent(new Event('change', {bubbles: true}));",
+                campo, digito
+            )
+            time.sleep(0.15)
+
+    # PASSO 4 — Clicar em "Verificar código"
+    print("🖱️ Clicando em 'Verificar código'...")
+    btn = None
+    for locator in [
+        (By.XPATH, "//button[normalize-space(text())='Verificar código']"),
+        (By.XPATH, "//button[contains(normalize-space(.), 'Verificar')]"),
+        (By.CSS_SELECTOR, "button[type='submit']"),
+    ]:
+        try:
+            btn = driver.find_element(*locator)
+            break
+        except Exception:
+            pass
+
+    if btn:
+        for _ in range(2):
+            try:
+                safe_click(btn)
+                break
+            except Exception:
+                try:
+                    driver.execute_script("arguments[0].click();", btn)
+                    break
+                except Exception:
+                    time.sleep(1)
+    else:
+        inputs[-1].send_keys(Keys.RETURN)
+
+    # PASSO 5 — Aguardar redirecionamento pós-2FA
+    print("⏳ Aguardando redirecionamento pós-2FA...")
+    try:
+        WebDriverWait(driver, 25).until(
+            lambda d: "performance/home" in d.current_url or "listings" in d.current_url
+        )
+    except TimeoutException:
+        msgs = []
+        try:
+            erros = driver.find_elements(
+                By.XPATH,
+                "//*[contains(text(),'inválido') or contains(text(),'incorreto') "
+                "or contains(text(),'expirado') or contains(text(),'erro')]"
+            )
+            msgs = [e.text for e in erros if e.is_displayed() and e.text.strip()]
+        except Exception:
+            pass
+        if msgs:
+            print(f"   Mensagens de erro: {msgs}")
+        raise Exception(f"2FA: redirecionamento não ocorreu. URL atual: {driver.current_url}")
+
+    print("✅ Código 2FA validado. Login no Canal Pro concluído.")
 
 
 def _canal_pro_navigate_to_listings():
