@@ -1002,74 +1002,149 @@ def _canal_pro_handle_cookie_popup():
 def _canal_pro_login():
     """
     Abre nova aba, faz login no Canal Pro e retorna o handle da aba do CRM.
-    Resistente a overlays de cookies e interceptação de elementos.
+    Campos usam type='text' e são identificados pelo atributo name.
     """
     aba_crm = driver.current_window_handle
     print("🔐 Abrindo nova aba para o Canal Pro...")
     driver.execute_script("window.open('');")
     driver.switch_to.window(driver.window_handles[-1])
 
-    print("🔐 Fazendo login no Canal Pro...")
+    # PASSO 1 — Navegar para login
+    print("🔐 Navegando para a página de login do Canal Pro...")
     driver.get(CANAL_PRO_URL_LOGIN)
-    time.sleep(2)  # Tempo para o banner de cookies aparecer
+    time.sleep(2)
 
+    # PASSO 2 — Tratar pop-up de cookies
     _canal_pro_handle_cookie_popup()
 
-    # Remove overlays que possam bloquear interação com o formulário
-    driver.execute_script("""
-        document.querySelectorAll('[class*="adopt-c-"], [class*="cookie-overlay"], [class*="backdrop"]')
-            .forEach(el => { if (el.tagName !== 'BUTTON') el.style.display = 'none'; });
-    """)
+    # Remove overlays residuais do banner
+    driver.execute_script(
+        "document.querySelectorAll('[class*=\"adopt-c-\"], [class*=\"cookie-overlay\"], [class*=\"backdrop\"]')"
+        ".forEach(el => { if (el.tagName !== 'BUTTON') el.style.display = 'none'; });"
+    )
+
+    def _preencher_campo(campo, valor, nome):
+        try:
+            campo.clear()
+            campo.send_keys(valor)
+        except Exception:
+            print(f"   ⚠️ send_keys falhou para campo {nome}. Usando fallback JavaScript...")
+            driver.execute_script(
+                "arguments[0].focus();"
+                "arguments[0].value = arguments[1];"
+                "arguments[0].dispatchEvent(new Event('input', {bubbles: true}));"
+                "arguments[0].dispatchEvent(new Event('change', {bubbles: true}));"
+                "arguments[0].dispatchEvent(new Event('blur', {bubbles: true}));",
+                campo, valor
+            )
+            print(f"   ✅ Campo {nome} preenchido via JavaScript.")
+
+        valor_atual = campo.get_attribute("value") or ""
+        if valor_atual != valor:
+            driver.execute_script(
+                "arguments[0].focus();"
+                "arguments[0].value = arguments[1];"
+                "arguments[0].dispatchEvent(new Event('input', {bubbles: true}));"
+                "arguments[0].dispatchEvent(new Event('change', {bubbles: true}));"
+                "arguments[0].dispatchEvent(new Event('blur', {bubbles: true}));",
+                campo, valor
+            )
+            valor_atual = campo.get_attribute("value") or ""
+            if valor_atual != valor:
+                raise Exception(f"Falha ao preencher campo '{nome}'. Esperado: '{valor}', obtido: '{valor_atual}'")
 
     try:
-        email_field = WebDriverWait(driver, 15).until(
-            EC.visibility_of_element_located((By.CSS_SELECTOR, "input[type='email']"))
-        )
+        # PASSO 3 — Localizar campo e-mail (Canal Pro usa type="text", não type="email")
+        print("📝 Localizando campo de e-mail...")
+        email_field = None
+        for locator in [
+            (By.CSS_SELECTOR, "input[name='email']"),
+            (By.XPATH, "//input[@placeholder='Digite seu e-mail']"),
+            (By.CSS_SELECTOR, "input.l-input__item[type='text']"),
+        ]:
+            try:
+                email_field = WebDriverWait(driver, 15).until(
+                    EC.presence_of_element_located(locator)
+                )
+                break
+            except Exception:
+                pass
+        if not email_field:
+            raise Exception("Campo de e-mail não encontrado na página de login do Canal Pro.")
 
-        # Preenche e-mail com fallback JS
-        try:
-            email_field.clear()
-            email_field.send_keys(CANALPRO_EMAIL)
-        except Exception:
-            driver.execute_script("arguments[0].value = arguments[1];", email_field, CANALPRO_EMAIL)
-            driver.execute_script("arguments[0].dispatchEvent(new Event('input', {bubbles:true}));", email_field)
-            driver.execute_script("arguments[0].dispatchEvent(new Event('change', {bubbles:true}));", email_field)
+        # PASSO 4 — Localizar campo senha (Canal Pro usa type="text", não type="password")
+        print("📝 Localizando campo de senha...")
+        senha_field = None
+        for locator in [
+            (By.CSS_SELECTOR, "input[name='password']"),
+            (By.XPATH, "//input[contains(@placeholder, 'Digite sua senha')]"),
+        ]:
+            try:
+                senha_field = driver.find_element(*locator)
+                break
+            except Exception:
+                pass
+        if not senha_field:
+            raise Exception("Campo de senha não encontrado na página de login do Canal Pro.")
 
-        senha_field = driver.find_element(By.CSS_SELECTOR, "input[type='password']")
+        # PASSO 5 — Preencher campos com fallback JS e validação
+        print(f"📝 Preenchendo e-mail: {CANALPRO_EMAIL}")
+        _preencher_campo(email_field, CANALPRO_EMAIL, "email")
 
-        # Preenche senha com fallback JS
-        try:
-            senha_field.clear()
-            senha_field.send_keys(CANALPRO_SENHA)
-        except Exception:
-            driver.execute_script("arguments[0].value = arguments[1];", senha_field, CANALPRO_SENHA)
-            driver.execute_script("arguments[0].dispatchEvent(new Event('input', {bubbles:true}));", senha_field)
-            driver.execute_script("arguments[0].dispatchEvent(new Event('change', {bubbles:true}));", senha_field)
+        print("📝 Preenchendo senha: [oculta]")
+        _preencher_campo(senha_field, CANALPRO_SENHA, "senha")
 
-        btn_entrar = driver.find_element(By.CSS_SELECTOR, "button[type='submit']")
-        try:
-            safe_click(btn_entrar)
-        except Exception:
-            driver.execute_script("arguments[0].click();", btn_entrar)
+        # PASSO 6 — Clicar em "Entrar"
+        print("🖱️ Clicando em 'Entrar'...")
+        btn_entrar = None
+        for locator in [
+            (By.XPATH, "//button[normalize-space(text())='Entrar']"),
+            (By.CSS_SELECTOR, "button[type='submit']"),
+        ]:
+            try:
+                btn_entrar = driver.find_element(*locator)
+                break
+            except Exception:
+                pass
 
-        # Aguarda redirecionamento pós-login (timeout 20s)
+        if btn_entrar:
+            try:
+                safe_click(btn_entrar)
+            except Exception:
+                driver.execute_script("arguments[0].click();", btn_entrar)
+        else:
+            senha_field.send_keys(Keys.RETURN)
+
+        # PASSO 7 — Validar redirecionamento
+        print("⏳ Aguardando redirecionamento pós-login...")
         try:
             WebDriverWait(driver, 20).until(
-                lambda d: "performance/home" in d.current_url or "listings" in d.current_url
+                lambda d: "performance/home" in d.current_url
+                or "listings" in d.current_url
+                or d.current_url != CANAL_PRO_URL_LOGIN
             )
         except Exception:
-            # Validação pós-login: URL ainda em /login?
-            current = driver.current_url
-            if "/login" in current:
-                html = driver.execute_script(
-                    "return document.body ? document.body.innerHTML.slice(0, 2000) : '';"
+            pass
+
+        current = driver.current_url
+        if "/login" in current:
+            msgs = []
+            try:
+                erros = driver.find_elements(
+                    By.XPATH,
+                    "//*[contains(text(),'obrigatório') or contains(text(),'inválido')"
+                    " or contains(text(),'incorret') or contains(text(),'erro')]"
                 )
-                print(f"🧪 HTML parcial da página de login:\n{html[:1000]}")
-                raise Exception(f"Login no Canal Pro falhou — URL ainda em /login após 20s. URL atual: {current}")
+                msgs = [e.text for e in erros if e.is_displayed() and e.text.strip()]
+            except Exception:
+                pass
+            if msgs:
+                print(f"   Mensagens de erro no formulário: {msgs}")
+            raise Exception(f"Login no Canal Pro falhou — URL ainda em /login. URL atual: {current}")
 
         time.sleep(2)
         _canal_pro_handle_cookie_popup()
-        print("✅ Login no Canal Pro realizado com sucesso.")
+        print(f"✅ Login no Canal Pro realizado. URL: {driver.current_url}")
         return aba_crm
 
     except Exception as exc:
