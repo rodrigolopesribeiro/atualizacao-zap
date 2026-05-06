@@ -1,3 +1,5 @@
+import email
+import imaplib
 import json
 import os
 from datetime import datetime, timedelta
@@ -28,6 +30,7 @@ VIVAREAL_VALUE = "9"
 # === CONFIGURACOES CANAL PRO ===
 CANALPRO_EMAIL = os.environ["CANALPRO_EMAIL"]
 CANALPRO_SENHA = os.environ["CANALPRO_SENHA"]
+GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD", "").replace(" ", "")
 CANAL_PRO_URL_LOGIN    = "https://canalpro.grupozap.com/login"
 CANAL_PRO_URL_LISTINGS = "https://canalpro.grupozap.com/ZAP_OLX/0/listings"
 VERIFICACAO_INTERVALO_SEGUNDOS = 600   # 10 minutos entre verificações
@@ -885,6 +888,87 @@ def process_part_1_collect_and_disable_vivareal():
 # PARTE INTERMEDIÁRIA — VERIFICAÇÃO NO CANAL PRO (ZAP IMÓVEIS)
 # =============================================================================
 
+def _get_2fa_code_from_gmail(timeout_seconds=180):
+    """
+    Conecta ao Gmail via IMAP e extrai o código 2FA do Canal Pro do e-mail mais recente.
+    Aguarda até `timeout_seconds` para o e-mail chegar. Retorna string de 6 dígitos.
+    """
+    import re as _re
+    from email.header import decode_header as _decode_header
+
+    print("📧 Conectando ao Gmail para buscar código 2FA automaticamente...")
+
+    deadline = time.time() + timeout_seconds
+    attempt = 1
+
+    while time.time() < deadline:
+        try:
+            mail = imaplib.IMAP4_SSL("imap.gmail.com")
+            mail.login(CANALPRO_EMAIL, GMAIL_APP_PASSWORD)
+            mail.select("INBOX")
+
+            # Busca e-mails não lidos dos últimos 10 minutos
+            _, ids = mail.search(None, "UNSEEN")
+            id_list = ids[0].split()
+
+            for msg_id in reversed(id_list):  # mais recente primeiro
+                _, msg_data = mail.fetch(msg_id, "(RFC822)")
+                raw = msg_data[0][1]
+                msg = email.message_from_bytes(raw)
+
+                from_addr = (msg.get("From") or "").lower()
+                subject_raw = msg.get("Subject") or ""
+                try:
+                    subject = str(_decode_header(subject_raw)[0][0])
+                except Exception:
+                    subject = subject_raw
+                subject = subject.lower()
+
+                # Filtra por remetente/assunto do Canal Pro / ZAP / OLX
+                termos = ["grupozap", "canalpro", "canal pro", "zap", "olx",
+                          "vivareal", "código", "codigo", "verification", "acesso"]
+                if not any(t in from_addr or t in subject for t in termos):
+                    continue
+
+                # Extrai texto do corpo
+                body = ""
+                if msg.is_multipart():
+                    for part in msg.walk():
+                        ct = part.get_content_type()
+                        if ct in ("text/plain", "text/html"):
+                            try:
+                                body += part.get_payload(decode=True).decode(errors="ignore")
+                            except Exception:
+                                pass
+                else:
+                    try:
+                        body = msg.get_payload(decode=True).decode(errors="ignore")
+                    except Exception:
+                        body = str(msg.get_payload())
+
+                # Extrai código de 6 dígitos
+                match = _re.search(r"\b(\d{6})\b", body)
+                if match:
+                    code = match.group(1)
+                    mail.store(msg_id, "+FLAGS", "\\Seen")
+                    mail.logout()
+                    print(f"✅ Código 2FA encontrado: {code}")
+                    return code
+
+            mail.logout()
+
+        except Exception as exc:
+            print(f"   ⚠️ Erro ao acessar Gmail: {type(exc).__name__} | {exc}")
+
+        remaining = int(deadline - time.time())
+        if remaining > 0:
+            print(f"   ⏳ Código não encontrado ainda. Próxima tentativa em 10s... ({remaining}s restantes)")
+            time.sleep(10)
+            attempt += 1
+
+    raise Exception(f"Código 2FA não encontrado no Gmail após {timeout_seconds}s")
+
+
 def _canal_pro_handle_cookie_popup():
     """
     Tenta fechar o banner de consentimento de cookies do Canal Pro.
@@ -1166,29 +1250,15 @@ def _canal_pro_aguardar_pos_login():
 
 def _canal_pro_handle_2fa():
     """
-    Trata autenticação em dois fatores do Canal Pro via pausa manual no terminal.
-    Depende de input() porque o código chega por e-mail e precisa de ação humana.
+    Trata autenticação em dois fatores do Canal Pro de forma totalmente automática.
+    Lê o código diretamente do Gmail via IMAP usando a App Password configurada.
     O Canal Pro exige 2FA quando detecta um 'novo dispositivo' (perfil Chrome sem
     cookies persistentes da sessão anterior).
     """
-    print("\n" + "=" * 60)
-    print("🔐 AUTENTICAÇÃO 2FA EXIGIDA PELO CANAL PRO")
-    print("=" * 60)
-    print("📧 Um código de 6 dígitos foi enviado para mkmarcoslopes@gmail.com")
-    print("⏰ Validade do código: 5 minutos")
-    print()
-    print("👉 Abra o Gmail, copie o código de 6 dígitos e cole abaixo.")
-    print()
+    print("\n🔐 Autenticação 2FA detectada — buscando código no Gmail automaticamente...")
 
-    while True:
-        codigo = input("➡️  Cole o código de 6 dígitos aqui: ").strip()
-        codigo_limpo = "".join(c for c in codigo if c.isdigit())
-        if len(codigo_limpo) == 6:
-            break
-        print(f"⚠️ Código inválido (recebi '{codigo}', extraí '{codigo_limpo}'). "
-              "Precisa ter exatamente 6 dígitos. Tente novamente.")
-
-    print(f"✅ Código recebido: {codigo_limpo}")
+    # PASSO 1 — Buscar código automaticamente no Gmail
+    codigo_limpo = _get_2fa_code_from_gmail(timeout_seconds=180)
 
     # PASSO 2 — Localizar os 6 campos do código
     print("📝 Localizando os 6 campos do código...")
