@@ -47,6 +47,10 @@ CATEGORIAS_VIVAREAL = {
     "7": "Destaque Triplo",
 }
 
+# ⚠️ APENAS PARA TESTE — voltar para False em execuções normais de produção
+# Quando True: pula a Parte 1, lê imoveis_parte1.json e começa na Parte Intermediária
+MODO_PULAR_PARTE_1 = True
+
 # Inicializados dentro de main() após wait_until_10am()
 driver = None
 wait = None
@@ -882,49 +886,123 @@ def process_part_1_collect_and_disable_vivareal():
 # =============================================================================
 
 def _canal_pro_handle_cookie_popup():
-    """Tenta fechar pop-up de cookies. Silencioso se não encontrar."""
-    print("🍪 Tentando fechar pop-up de cookies...")
-    try:
-        selectors = [
-            "[class*='cookie'] button",
-            "[class*='consent'] button",
-            "[id*='cookie'] button",
-            "[class*='lgpd'] button",
-            "button[class*='accept']",
-        ]
-        texts = ["aceitar", "aceitar todos", "accept", "ok", "concordo", "entendi"]
+    """
+    Tenta fechar o banner de consentimento de cookies do Canal Pro.
+    Usa 4 camadas em ordem de prioridade. Silencioso se não encontrar.
+    """
+    print("🍪 Procurando pop-up de cookies...")
 
-        for sel in selectors:
+    def _try_click_btn(btn, camada):
+        try:
+            if not btn.is_displayed():
+                return False
+            try:
+                safe_click(btn)
+            except Exception:
+                driver.execute_script("arguments[0].click();", btn)
+            time.sleep(1.5)
+            # Confirma fechamento: se o botão ainda estiver visível, tenta JS
+            try:
+                if btn.is_displayed():
+                    driver.execute_script("arguments[0].click();", btn)
+                    time.sleep(1)
+            except Exception:
+                pass
+            print(f"🍪 Pop-up de cookies fechado com sucesso (Camada {camada}).")
+            return True
+        except Exception:
+            return False
+
+    # CAMADA 1 — Seletor exato pelo texto "Salvar opções" (Adopt banner)
+    try:
+        btn = driver.find_element(By.XPATH, "//button[normalize-space(text())='Salvar opções']")
+        if _try_click_btn(btn, 1):
+            return
+    except Exception:
+        pass
+
+    # CAMADA 2 — Prefixo de classe "adopt-c-"
+    try:
+        candidates = driver.find_elements(By.CSS_SELECTOR, "button[class^='adopt-c-']")
+        for btn in candidates:
+            txt = (btn.text or "").strip().lower()
+            if "salvar" in txt or "aceitar" in txt or "ok" in txt:
+                if _try_click_btn(btn, 2):
+                    return
+        # Fallback: último visível dos candidatos adopt-c-
+        for btn in reversed(candidates):
+            if _try_click_btn(btn, 2):
+                return
+    except Exception:
+        pass
+
+    # CAMADA 3 — Seletores genéricos de banners
+    generic_selectors = [
+        "button[class*='cookie']",
+        "button[class*='consent']",
+        "button[id*='cookie']",
+        "button[class*='accept']",
+        "button[class*='lgpd']",
+    ]
+    generic_texts = {"aceitar", "aceitar todos", "accept", "ok", "concordo", "entendi", "salvar"}
+    try:
+        for sel in generic_selectors:
             try:
                 btn = driver.find_element(By.CSS_SELECTOR, sel)
-                if btn.is_displayed():
-                    safe_click(btn)
-                    time.sleep(1)
-                    print("🍪 Pop-up de cookies fechado.")
+                if _try_click_btn(btn, 3):
                     return
             except Exception:
                 pass
-
-        # Tenta por texto
         for btn in driver.find_elements(By.TAG_NAME, "button"):
             try:
-                if btn.is_displayed() and (btn.text or "").strip().lower() in texts:
-                    safe_click(btn)
-                    time.sleep(1)
-                    print("🍪 Pop-up de cookies fechado.")
-                    return
+                if (btn.text or "").strip().lower() in generic_texts:
+                    if _try_click_btn(btn, 3):
+                        return
             except Exception:
                 pass
-
-        print("🍪 Nenhum pop-up de cookies encontrado.")
     except Exception:
-        print("🍪 Nenhum pop-up de cookies encontrado.")
+        pass
+
+    # CAMADA 4 — Busca dentro de iframes
+    try:
+        iframes = driver.find_elements(By.TAG_NAME, "iframe")
+        for iframe in iframes:
+            try:
+                driver.switch_to.frame(iframe)
+                # Tenta Camadas 1-3 dentro do iframe
+                for sel in ["//button[normalize-space(text())='Salvar opções']"]:
+                    try:
+                        btn = driver.find_element(By.XPATH, sel)
+                        if _try_click_btn(btn, 4):
+                            driver.switch_to.default_content()
+                            return
+                    except Exception:
+                        pass
+                for btn in driver.find_elements(By.TAG_NAME, "button"):
+                    try:
+                        if (btn.text or "").strip().lower() in generic_texts:
+                            if _try_click_btn(btn, 4):
+                                driver.switch_to.default_content()
+                                return
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            finally:
+                try:
+                    driver.switch_to.default_content()
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    print("🍪 Nenhum pop-up de cookies detectado. Prosseguindo.")
 
 
 def _canal_pro_login():
     """
-    Abre nova aba, faz login no Canal Pro e retorna o handle da aba do CRM
-    para poder voltar a ela depois.
+    Abre nova aba, faz login no Canal Pro e retorna o handle da aba do CRM.
+    Resistente a overlays de cookies e interceptação de elementos.
     """
     aba_crm = driver.current_window_handle
     print("🔐 Abrindo nova aba para o Canal Pro...")
@@ -933,28 +1011,62 @@ def _canal_pro_login():
 
     print("🔐 Fazendo login no Canal Pro...")
     driver.get(CANAL_PRO_URL_LOGIN)
-    time.sleep(3)
+    time.sleep(2)  # Tempo para o banner de cookies aparecer
 
     _canal_pro_handle_cookie_popup()
+
+    # Remove overlays que possam bloquear interação com o formulário
+    driver.execute_script("""
+        document.querySelectorAll('[class*="adopt-c-"], [class*="cookie-overlay"], [class*="backdrop"]')
+            .forEach(el => { if (el.tagName !== 'BUTTON') el.style.display = 'none'; });
+    """)
 
     try:
         email_field = WebDriverWait(driver, 15).until(
             EC.visibility_of_element_located((By.CSS_SELECTOR, "input[type='email']"))
         )
-        email_field.clear()
-        email_field.send_keys(CANALPRO_EMAIL)
+
+        # Preenche e-mail com fallback JS
+        try:
+            email_field.clear()
+            email_field.send_keys(CANALPRO_EMAIL)
+        except Exception:
+            driver.execute_script("arguments[0].value = arguments[1];", email_field, CANALPRO_EMAIL)
+            driver.execute_script("arguments[0].dispatchEvent(new Event('input', {bubbles:true}));", email_field)
+            driver.execute_script("arguments[0].dispatchEvent(new Event('change', {bubbles:true}));", email_field)
 
         senha_field = driver.find_element(By.CSS_SELECTOR, "input[type='password']")
-        senha_field.clear()
-        senha_field.send_keys(CANALPRO_SENHA)
+
+        # Preenche senha com fallback JS
+        try:
+            senha_field.clear()
+            senha_field.send_keys(CANALPRO_SENHA)
+        except Exception:
+            driver.execute_script("arguments[0].value = arguments[1];", senha_field, CANALPRO_SENHA)
+            driver.execute_script("arguments[0].dispatchEvent(new Event('input', {bubbles:true}));", senha_field)
+            driver.execute_script("arguments[0].dispatchEvent(new Event('change', {bubbles:true}));", senha_field)
 
         btn_entrar = driver.find_element(By.CSS_SELECTOR, "button[type='submit']")
-        safe_click(btn_entrar)
+        try:
+            safe_click(btn_entrar)
+        except Exception:
+            driver.execute_script("arguments[0].click();", btn_entrar)
 
-        # Aguarda redirecionamento pós-login
-        WebDriverWait(driver, 30).until(
-            lambda d: "performance/home" in d.current_url or "listings" in d.current_url
-        )
+        # Aguarda redirecionamento pós-login (timeout 20s)
+        try:
+            WebDriverWait(driver, 20).until(
+                lambda d: "performance/home" in d.current_url or "listings" in d.current_url
+            )
+        except Exception:
+            # Validação pós-login: URL ainda em /login?
+            current = driver.current_url
+            if "/login" in current:
+                html = driver.execute_script(
+                    "return document.body ? document.body.innerHTML.slice(0, 2000) : '';"
+                )
+                print(f"🧪 HTML parcial da página de login:\n{html[:1000]}")
+                raise Exception(f"Login no Canal Pro falhou — URL ainda em /login após 20s. URL atual: {current}")
+
         time.sleep(2)
         _canal_pro_handle_cookie_popup()
         print("✅ Login no Canal Pro realizado com sucesso.")
@@ -1314,28 +1426,47 @@ def main():
         time.sleep(5)
         print("✅ Login realizado.")
 
-        if not go_to_imoveis_page_fresh():
-            raise Exception("Não foi possível abrir Imóveis para iniciar a Parte 1.")
+        if MODO_PULAR_PARTE_1:
+            # =====================================================================
+            # MODO TESTE: pula Parte 1, retoma da Parte Intermediária
+            # =====================================================================
+            print("\n⏭️ MODO TESTE: pulando Parte 1 (já executada anteriormente).")
+            print("   Lendo imoveis_parte1.json para retomar Parte Intermediária...")
 
-        apply_initial_filters()
+            if not os.path.exists("imoveis_parte1.json"):
+                raise Exception(
+                    "imoveis_parte1.json não encontrado. "
+                    "Não é possível pular a Parte 1 sem esse arquivo."
+                )
 
-        # =====================================================================
-        # PARTE 1: filtra, edita descrição/foto, salva categoria+código,
-        #          desmarca VivaReal e salva
-        # =====================================================================
-        print("\n🚧 ===== PARTE 1: desmarcando VivaReal =====")
-        imoveis_processados = process_part_1_collect_and_disable_vivareal()
-        print(f"📦 Total de imóveis salvos para a Parte 2: {len(imoveis_processados)}")
+            with open("imoveis_parte1.json", "r", encoding="utf-8") as f:
+                data = json.load(f)
+                imoveis_processados = data.get("imoveis", [])
 
-        with open("imoveis_parte1.json", "w", encoding="utf-8") as f:
-            json.dump(
-                {"timestamp": datetime.now().isoformat(), "imoveis": imoveis_processados},
-                f, ensure_ascii=False, indent=2
-            )
-        print("💾 imoveis_parte1.json salvo.")
+            print(f"📦 {len(imoveis_processados)} imóvel(is) carregados do JSON.")
 
-        print("🚀 Atualizando VivaReal após Parte 1...")
-        go_to_integracoes_parceiros_and_update_vivareal()
+        else:
+            # =====================================================================
+            # FLUXO NORMAL: executa Parte 1
+            # =====================================================================
+            if not go_to_imoveis_page_fresh():
+                raise Exception("Não foi possível abrir Imóveis para iniciar a Parte 1.")
+
+            apply_initial_filters()
+
+            print("\n🚧 ===== PARTE 1: desmarcando VivaReal =====")
+            imoveis_processados = process_part_1_collect_and_disable_vivareal()
+            print(f"📦 Total de imóveis salvos para a Parte 2: {len(imoveis_processados)}")
+
+            with open("imoveis_parte1.json", "w", encoding="utf-8") as f:
+                json.dump(
+                    {"timestamp": datetime.now().isoformat(), "imoveis": imoveis_processados},
+                    f, ensure_ascii=False, indent=2
+                )
+            print("💾 imoveis_parte1.json salvo.")
+
+            print("🚀 Atualizando VivaReal após Parte 1...")
+            go_to_integracoes_parceiros_and_update_vivareal()
 
         # =====================================================================
         # PARTE INTERMEDIÁRIA: verifica no Canal Pro se os imóveis foram
