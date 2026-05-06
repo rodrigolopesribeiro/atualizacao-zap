@@ -1,6 +1,5 @@
 import json
 import os
-import re
 from datetime import datetime, timedelta
 import time
 
@@ -29,10 +28,15 @@ VIVAREAL_VALUE = "9"
 # === CONFIGURACOES CANAL PRO ===
 CANALPRO_EMAIL = os.environ["CANALPRO_EMAIL"]
 CANALPRO_SENHA = os.environ["CANALPRO_SENHA"]
-CANALPRO_LOGIN_URL = "https://canalpro.grupozap.com/login"
-CANALPRO_LISTINGS_BASE_URL = "https://canalpro.grupozap.com/ZAP_OLX/0/listings"
-POLLING_INTERVAL_SECONDS = 600  # intervalo entre verificações (10 minutos)
-MAX_WAIT_SECONDS = 8 * 3600    # timeout máximo de 8 horas
+CANAL_PRO_URL_LOGIN    = "https://canalpro.grupozap.com/login"
+CANAL_PRO_URL_LISTINGS = "https://canalpro.grupozap.com/ZAP_OLX/0/listings"
+VERIFICACAO_INTERVALO_SEGUNDOS = 600   # 10 minutos entre verificações
+VERIFICACAO_TIMEOUT_SEGUNDOS   = 8 * 3600  # timeout máximo de 8 horas
+# Aliases para compatibilidade
+CANALPRO_LOGIN_URL = CANAL_PRO_URL_LOGIN
+CANALPRO_LISTINGS_BASE_URL = CANAL_PRO_URL_LISTINGS
+POLLING_INTERVAL_SECONDS = VERIFICACAO_INTERVALO_SEGUNDOS
+MAX_WAIT_SECONDS = VERIFICACAO_TIMEOUT_SEGUNDOS
 
 CATEGORIAS_VIVAREAL = {
     "0": "Simples",
@@ -509,15 +513,47 @@ def expand_menu_if_needed():
 
 
 def apply_initial_filters():
-    divulgacao_link = wait.until(
-        EC.element_to_be_clickable(
-            (By.XPATH,
-             "//a[contains(normalize-space(.),'Divulgação') and contains(normalize-space(.),'Portais')]"
-             " | //a[contains(normalize-space(.),'Divulgacao') and contains(normalize-space(.),'Portais')]"
-             " | //a[contains(normalize-space(.),'divulga') and contains(normalize-space(.),'portai')]")
-        )
+    # Aguarda a página estabilizar
+    time.sleep(2)
+
+    # Encontra o link "Divulgação em Portais" via JavaScript (robusto com acentos)
+    found = driver.execute_script(
+        """
+        const terms = ['divulga', 'portai'];
+        const links = Array.from(document.querySelectorAll('a'));
+        const link = links.find(a => {
+            const t = (a.textContent || '').toLowerCase()
+                        .normalize('NFD').replace(/[̀-ͯ]/g, '');
+            return terms.every(term => t.includes(term));
+        });
+        if (link) { link.click(); return true; }
+        return false;
+        """
     )
-    safe_click(divulgacao_link)
+
+    if not found:
+        # Fallback: itera links com proteção contra StaleElement
+        for _ in range(3):
+            try:
+                links = driver.find_elements(By.TAG_NAME, "a")
+                for link in links:
+                    try:
+                        txt = (link.text or "").strip().lower()
+                        if "divulga" in txt and "portai" in txt:
+                            safe_click(link)
+                            found = True
+                            break
+                    except Exception:
+                        continue
+                if found:
+                    break
+                time.sleep(1)
+            except Exception:
+                time.sleep(1)
+
+    if not found:
+        raise Exception("Não encontrei o link 'Divulgação em Portais' na tela de filtros.")
+
     time.sleep(1)
 
     wait.until(EC.element_to_be_clickable((By.XPATH, "//select[@data-input='idportal']"))).click()
@@ -845,152 +881,200 @@ def process_part_1_collect_and_disable_vivareal():
 # PARTE INTERMEDIÁRIA — VERIFICAÇÃO NO CANAL PRO (ZAP IMÓVEIS)
 # =============================================================================
 
-def login_canalpro():
-    """Faz login no Canal Pro em nova aba, mantendo o CRM na aba original."""
+def _canal_pro_handle_cookie_popup():
+    """Tenta fechar pop-up de cookies. Silencioso se não encontrar."""
+    print("🍪 Tentando fechar pop-up de cookies...")
+    try:
+        selectors = [
+            "[class*='cookie'] button",
+            "[class*='consent'] button",
+            "[id*='cookie'] button",
+            "[class*='lgpd'] button",
+            "button[class*='accept']",
+        ]
+        texts = ["aceitar", "aceitar todos", "accept", "ok", "concordo", "entendi"]
+
+        for sel in selectors:
+            try:
+                btn = driver.find_element(By.CSS_SELECTOR, sel)
+                if btn.is_displayed():
+                    safe_click(btn)
+                    time.sleep(1)
+                    print("🍪 Pop-up de cookies fechado.")
+                    return
+            except Exception:
+                pass
+
+        # Tenta por texto
+        for btn in driver.find_elements(By.TAG_NAME, "button"):
+            try:
+                if btn.is_displayed() and (btn.text or "").strip().lower() in texts:
+                    safe_click(btn)
+                    time.sleep(1)
+                    print("🍪 Pop-up de cookies fechado.")
+                    return
+            except Exception:
+                pass
+
+        print("🍪 Nenhum pop-up de cookies encontrado.")
+    except Exception:
+        print("🍪 Nenhum pop-up de cookies encontrado.")
+
+
+def _canal_pro_login():
+    """
+    Abre nova aba, faz login no Canal Pro e retorna o handle da aba do CRM
+    para poder voltar a ela depois.
+    """
+    aba_crm = driver.current_window_handle
     print("🔐 Abrindo nova aba para o Canal Pro...")
     driver.execute_script("window.open('');")
     driver.switch_to.window(driver.window_handles[-1])
+
     print("🔐 Fazendo login no Canal Pro...")
-    driver.get(CANALPRO_LOGIN_URL)
+    driver.get(CANAL_PRO_URL_LOGIN)
     time.sleep(3)
 
+    _canal_pro_handle_cookie_popup()
+
     try:
-        email_field = wait.until(
-            EC.visibility_of_element_located(
-                (By.XPATH, "//input[@type='email' or @name='email' or @id='email']")
-            )
+        email_field = WebDriverWait(driver, 15).until(
+            EC.visibility_of_element_located((By.CSS_SELECTOR, "input[type='email']"))
         )
         email_field.clear()
         email_field.send_keys(CANALPRO_EMAIL)
 
-        senha_field = driver.find_element(
-            By.XPATH, "//input[@type='password' or @name='password' or @id='password']"
-        )
+        senha_field = driver.find_element(By.CSS_SELECTOR, "input[type='password']")
         senha_field.clear()
         senha_field.send_keys(CANALPRO_SENHA)
 
-        btn_entrar = driver.find_element(
-            By.XPATH,
-            "//button[@type='submit']"
-            " | //button[contains(normalize-space(.),'Entrar')]"
-        )
+        btn_entrar = driver.find_element(By.CSS_SELECTOR, "button[type='submit']")
         safe_click(btn_entrar)
-        time.sleep(5)
-        print("✅ Login no Canal Pro realizado.")
+
+        # Aguarda redirecionamento pós-login
+        WebDriverWait(driver, 30).until(
+            lambda d: "performance/home" in d.current_url or "listings" in d.current_url
+        )
+        time.sleep(2)
+        _canal_pro_handle_cookie_popup()
+        print("✅ Login no Canal Pro realizado com sucesso.")
+        return aba_crm
 
     except Exception as exc:
         print(f"⛔ Falha no login do Canal Pro: {type(exc).__name__} | {repr(exc)}")
         raise
 
 
-def _extract_codes_from_canalpro_page():
+def _canal_pro_navigate_to_listings():
     """
-    Extrai os códigos dos imóveis listados na página atual do Canal Pro.
-    Cada card exibe o código como número após o tipo de transação
-    (ex: "Venda 1432"). Retorna um conjunto de strings.
+    Navega para a página de Anúncios via menu hamburguer.
+    Fallback: navega diretamente pela URL.
     """
-    codes = set()
+    print("📋 Navegando para a página de Anúncios...")
+    _canal_pro_handle_cookie_popup()
 
-    # Estratégia 1: atributos data-* que possam conter o código
     try:
-        elements = driver.find_elements(
-            By.XPATH,
-            "//*[@data-listing-id or @data-id or @data-code or @data-codigo]"
+        # Clica no hamburguer
+        hamburger = WebDriverWait(driver, 10).until(
+            EC.element_to_be_clickable((By.CSS_SELECTOR, "button#menu-burger-button"))
         )
-        for el in elements:
-            for attr in ("data-listing-id", "data-id", "data-code", "data-codigo"):
-                val = (el.get_attribute(attr) or "").strip()
-                if val and val.isdigit():
-                    codes.add(val)
-    except Exception:
-        pass
+        safe_click(hamburger)
+        time.sleep(0.8)
 
-    # Estratégia 2: texto "Venda 1432" / "Aluguel 1286" — número após o tipo
-    try:
-        # Tenta encontrar spans/divs com padrão "tipo número"
-        candidates = driver.find_elements(
-            By.XPATH,
-            "//*[contains(@class,'listing') or contains(@class,'property') or contains(@class,'card')]"
-            "//*[contains(normalize-space(.),'Venda') or contains(normalize-space(.),'Aluguel')]"
+        # Clica em Anúncios
+        anuncios_btn = WebDriverWait(driver, 10).until(
+            EC.element_to_be_clickable((By.CSS_SELECTOR, "button#menu-anuncios-button"))
         )
-        for el in candidates:
-            txt = (el.text or "").strip()
-            # Extrai o número que segue imediatamente a palavra "Venda" ou "Aluguel"
-            match = re.search(r'(?:Venda|Aluguel)\s+(\d+)', txt)
-            if match:
-                codes.add(match.group(1))
-    except Exception:
-        pass
+        safe_click(anuncios_btn)
 
-    # Estratégia 3: todos os textos da página que sejam somente números de 3-6 dígitos
-    # próximos a badges de transação (fallback amplo)
-    if not codes:
-        try:
-            page_text = driver.find_element(By.TAG_NAME, "body").text or ""
-            for match in re.finditer(r'(?:Venda|Aluguel)\s+(\d{3,6})', page_text):
-                codes.add(match.group(1))
-        except Exception:
-            pass
-
-    # Remove códigos de cards com badge "Bloqueado" — contam como removidos do ar
-    try:
-        blocked_cards = driver.find_elements(
-            By.XPATH,
-            "//*[contains(@class,'blocked') or @data-status='blocked'"
-            " or .//*[contains(translate(normalize-space(.),'BLOQUEADO','bloqueado'),'bloqueado')]]"
+        # Confirma que a página carregou
+        WebDriverWait(driver, 15).until(
+            lambda d: "/listings" in d.current_url or
+            len(d.find_elements(By.CSS_SELECTOR, "span.card-content__tag")) > 0
         )
-        for card in blocked_cards:
-            card_text = card.text or ""
-            for match in re.finditer(r'(?:Venda|Aluguel)\s+(\d{3,6})', card_text):
-                codes.discard(match.group(1))
-            for attr in ("data-listing-id", "data-id", "data-code", "data-codigo"):
-                val = (card.get_attribute(attr) or "").strip()
-                if val:
-                    codes.discard(val)
-    except Exception:
-        pass
+        time.sleep(2)
+        _canal_pro_handle_cookie_popup()
+        print("✅ Página de Anúncios carregada.")
 
-    return codes
+    except Exception as exc:
+        print(f"⚠️ Navegação pelo menu falhou: {type(exc).__name__}. Tentando URL direta...")
+        driver.get(CANAL_PRO_URL_LISTINGS)
+        time.sleep(3)
+        _canal_pro_handle_cookie_popup()
+        print("✅ Página de Anúncios carregada (fallback URL).")
 
 
-def get_all_active_codes_canalpro():
+def _canal_pro_collect_all_active_codes():
     """
-    Percorre todas as páginas de listagens ativas no Canal Pro e retorna
-    um conjunto com todos os códigos de imóveis encontrados.
+    Varre todas as páginas de anúncios do Canal Pro e retorna um set com
+    todos os códigos ativos. Retorna None se o resultado for inválido
+    (0 elementos sem confirmação de lista vazia).
+    Anúncios com badge 'Bloqueado' ainda constam na listagem e são ATIVOS.
     """
     all_codes = set()
     page = 1
+    wait_cards = WebDriverWait(driver, 15)
 
     while True:
-        url = f"{CANALPRO_LISTINGS_BASE_URL}?backPath=App.Listing&pageNumber={page}"
-        driver.get(url)
-        time.sleep(3)
+        # Aguarda cards ou mensagem de lista vazia
+        try:
+            wait_cards.until(
+                lambda d: len(d.find_elements(By.CSS_SELECTOR, "span.card-content__tag")) > 0
+                or any(
+                    t in (d.find_element(By.TAG_NAME, "body").text or "").lower()
+                    for t in ["nenhum anúncio", "0 anúncios", "nenhum resultado", "sem anúncios"]
+                )
+            )
+        except Exception:
+            time.sleep(3)
 
-        page_codes = _extract_codes_from_canalpro_page()
-        print(f"   Página {page}: {len(page_codes)} código(s) encontrado(s).")
+        elements = driver.find_elements(By.CSS_SELECTOR, "span.card-content__tag")
+        page_codes = set()
+        for el in elements:
+            try:
+                code = (el.text or "").strip()
+                if code.isdigit():
+                    page_codes.add(code)
+            except Exception:
+                pass
 
-        if not page_codes and page > 1:
-            # Página vazia após a primeira — chegamos ao fim
-            break
+        # Validação anti-falso-positivo
+        if not page_codes:
+            body_text = (driver.find_element(By.TAG_NAME, "body").text or "").lower()
+            lista_vazia = any(t in body_text for t in [
+                "nenhum anúncio", "0 anúncios", "nenhum resultado", "sem anúncios"
+            ])
+            # Verifica contador "0 - 0 de 0" ou similar
+            try:
+                contador = driver.find_element(
+                    By.XPATH,
+                    "//*[contains(normalize-space(.),'de 0') or normalize-space(.)='0']"
+                )
+                lista_vazia = lista_vazia or bool(contador)
+            except Exception:
+                pass
 
+            if not lista_vazia:
+                print(f"   ⚠️ AVISO: Página {page} retornou 0 códigos sem confirmação de lista vazia. Dado inválido.")
+                return None
+
+        sorted_codes = sorted(page_codes)
+        print(f"   📄 Página {page}: {len(page_codes)} código(s) coletado(s): {sorted_codes}")
         all_codes.update(page_codes)
 
-        # Verifica se há próxima página
+        # Verifica próxima página
         try:
             next_btn = driver.find_element(
-                By.XPATH,
-                "//button[contains(@aria-label,'próxima') or contains(@aria-label,'next')]"
-                " | //*[contains(@class,'pagination')]//li[last()]/a"
-                " | //*[contains(@class,'pagination-next') and not(contains(@class,'disabled'))]"
+                By.CSS_SELECTOR,
+                "button[aria-label='Próxima Página'], button.pagination__button--next"
             )
-            if not next_btn.is_enabled() or "disabled" in (next_btn.get_attribute("class") or ""):
+            if next_btn.is_enabled() and "disabled" not in (next_btn.get_attribute("class") or ""):
+                safe_click(next_btn)
+                time.sleep(2)
+                page += 1
+            else:
                 break
-            # Se o número de códigos desta página for zero, não há mais páginas
-            if not page_codes:
-                break
-            page += 1
         except Exception:
-            # Não encontrou botão de próxima página — fim da listagem
             break
 
     return all_codes
@@ -998,60 +1082,93 @@ def get_all_active_codes_canalpro():
 
 def verify_properties_removed_from_zap(imoveis_processados):
     """
-    Parte Intermediária: verifica indefinidamente no Canal Pro se todos os
-    imóveis de `imoveis_processados` foram removidos dos anúncios ativos.
-    Só retorna quando a remoção de TODOS for confirmada.
+    Parte Intermediária: abre o Canal Pro em nova aba e verifica a cada
+    VERIFICACAO_INTERVALO_SEGUNDOS se os imóveis da Parte 1 foram removidos
+    dos anúncios ativos. Só avança quando TODOS estiverem removidos.
+    Timeout máximo: VERIFICACAO_TIMEOUT_SEGUNDOS.
     """
+    # Fallback: tenta carregar do JSON se lista vier vazia
     if not imoveis_processados:
-        print("ℹ️ Nenhum imóvel na lista — verificação do Canal Pro ignorada.")
-        return
+        try:
+            with open("imoveis_parte1.json", encoding="utf-8") as f:
+                data = json.load(f)
+                imoveis_processados = data.get("imoveis", [])
+            print(f"ℹ️ Lista carregada do imoveis_parte1.json ({len(imoveis_processados)} imóvel(is)).")
+        except Exception:
+            print("ℹ️ Nenhum imóvel na lista e imoveis_parte1.json não encontrado — verificação ignorada.")
+            return
 
     codigos_alvo = {str(item["codigo"]).strip() for item in imoveis_processados}
     print(f"\n🔍 Parte Intermediária: monitorando remoção de {len(codigos_alvo)} imóvel(is) no ZAP Imóveis...")
     print(f"   Códigos aguardados: {sorted(codigos_alvo)}")
-    print(f"   Intervalo entre verificações: {POLLING_INTERVAL_SECONDS // 60} minuto(s)\n")
+    print(f"   Intervalo entre verificações: {VERIFICACAO_INTERVALO_SEGUNDOS // 60} minuto(s)\n")
 
-    login_canalpro()
+    aba_crm = _canal_pro_login()
+    _canal_pro_navigate_to_listings()
 
-    start_time = time.time()
+    inicio = time.time()
     tentativa = 1
-    while True:
-        horario = datetime.now().strftime("%H:%M:%S")
-        print(f"🔍 [{horario}] Verificação #{tentativa} — buscando anúncios ativos no Canal Pro...")
 
-        if time.time() - start_time > MAX_WAIT_SECONDS:
-            print("⛔ Timeout de 8h atingido — nenhum anúncio foi completamente removido a tempo.")
-            print("   Encerrando sem executar a Parte 3.")
+    while True:
+        # Verifica timeout
+        if time.time() - inicio > VERIFICACAO_TIMEOUT_SEGUNDOS:
+            print(f"⛔ TIMEOUT: imóveis não foram removidos do ZAP em "
+                  f"{VERIFICACAO_TIMEOUT_SEGUNDOS // 3600} hora(s). Encerrando.")
             driver.close()
-            driver.switch_to.window(driver.window_handles[0])
-            raise TimeoutError("Timeout de 8h atingido na verificação do Canal Pro.")
+            driver.switch_to.window(aba_crm)
+            raise TimeoutError(f"Timeout de {VERIFICACAO_TIMEOUT_SEGUNDOS // 3600}h na verificação do Canal Pro.")
+
+        horario = datetime.now().strftime("%H:%M:%S")
+        print(f"🔍 [{horario}] Verificação #{tentativa} — varrendo anúncios no Canal Pro...")
 
         try:
-            ativos = get_all_active_codes_canalpro()
+            ativos = _canal_pro_collect_all_active_codes()
         except Exception as exc:
-            print(f"⚠️ Erro ao consultar Canal Pro: {type(exc).__name__} | {repr(exc)}")
-            print(f"   Tentando novo login e repetindo em {POLLING_INTERVAL_SECONDS // 60} min...")
-            try:
-                login_canalpro()
-            except Exception:
-                pass
-            time.sleep(POLLING_INTERVAL_SECONDS)
+            print(f"⚠️ Erro ao coletar códigos: {type(exc).__name__} | {repr(exc)}")
+            ativos = None
+
+        if ativos is None:
+            print(f"   ⚠️ Resultado inválido — aguardando {VERIFICACAO_INTERVALO_SEGUNDOS // 60} min antes de tentar novamente.")
+            time.sleep(VERIFICACAO_INTERVALO_SEGUNDOS)
             tentativa += 1
+            _canal_pro_navigate_to_listings()
             continue
 
+        print(f"   📊 Total de códigos ativos no Canal Pro: {len(ativos)}")
+
         ainda_ativos = codigos_alvo & ativos
+        ja_removidos = codigos_alvo - ativos
+
+        if ja_removidos:
+            print(f"   ✅ Já removidos do ZAP: {sorted(ja_removidos)}")
 
         if not ainda_ativos:
-            print("✅ Todos os imóveis confirmados como removidos do ZAP Imóveis!")
-            print("   Fechando aba do Canal Pro e retornando ao CRM...\n")
+            print("✅ TODOS os imóveis confirmados como removidos do ZAP Imóveis!")
+            print("🔒 Fechando aba do Canal Pro e retornando ao CRM...\n")
             driver.close()
-            driver.switch_to.window(driver.window_handles[0])
+            driver.switch_to.window(aba_crm)
             return
 
-        print(f"⏳ {len(ainda_ativos)} imóvel(is) ainda ativo(s) no ZAP: {sorted(ainda_ativos)}")
-        print(f"   Próxima verificação em {POLLING_INTERVAL_SECONDS // 60} minuto(s)...")
-        time.sleep(POLLING_INTERVAL_SECONDS)
+        proxima = datetime.now().strftime("%H:%M:%S")
+        print(f"   ⏳ Ainda ativos no ZAP ({len(ainda_ativos)} imóvel(is)): {sorted(ainda_ativos)}")
+        print(f"   ⏱️ Próxima verificação em {VERIFICACAO_INTERVALO_SEGUNDOS // 60} minuto(s)... [{proxima}]")
+        time.sleep(VERIFICACAO_INTERVALO_SEGUNDOS)
         tentativa += 1
+
+        # Renavega para listings (sem novo login)
+        try:
+            _canal_pro_navigate_to_listings()
+        except Exception as exc:
+            print(f"⚠️ Falha ao renavegar — tentando login novamente: {type(exc).__name__}")
+            try:
+                aba_crm = _canal_pro_login()
+                _canal_pro_navigate_to_listings()
+            except Exception:
+                pass
+
+
+
+
 
 
 # =============================================================================
@@ -1163,10 +1280,13 @@ def main():
     global driver, wait, actions
 
     em_nuvem = os.getenv("CI", "") == "true"
+    teste_local = os.getenv("TEST_MODE", "") == "true"
 
-    # Localmente aguarda as 10h; em nuvem o cron do GitHub Actions cuida do horário
-    if not em_nuvem:
+    # Localmente aguarda as 10h; em nuvem ou modo teste, inicia imediatamente
+    if not em_nuvem and not teste_local:
         wait_until_10am()
+    elif teste_local:
+        print("🧪 MODO TESTE: pulando espera das 10h.")
 
     options = Options()
     options.add_argument("--disable-notifications")
