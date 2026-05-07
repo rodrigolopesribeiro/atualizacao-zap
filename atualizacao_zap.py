@@ -950,54 +950,19 @@ def _extrair_corpo_email(msg):
 def _gmail_buscar_codigo_2fa(service, janela_segundos=300):
     """
     Busca o código 2FA do Canal Pro nos e-mails recentes via Gmail API.
-    Só retorna código se vier de e-mail claramente relacionado ao ZAP/Canal Pro.
+    Ordena por internalDate e extrai o código APENAS do e-mail mais recente,
+    evitando pegar códigos antigos de tentativas anteriores.
     """
-    padroes_especificos = [
+    padroes = [
         r"confirmar[:\s]+(\d{6})",
         r"código[:\s]+(\d{6})",
         r"codigo[:\s]+(\d{6})",
+        r"\b(\d{6})\b",
     ]
-    termos_zap = ["zap", "grupozap", "olx", "vivareal", "canal", "confirmação", "codigo"]
-
-    def _tentar_extrair(msg_ref):
-        try:
-            msg = service.users().messages().get(
-                userId="me", id=msg_ref["id"], format="full"
-            ).execute()
-
-            headers = {h["name"].lower(): h["value"]
-                       for h in msg.get("payload", {}).get("headers", [])}
-            from_h    = headers.get("from", "").lower()
-            subject_h = headers.get("subject", "").lower()
-            snippet   = msg.get("snippet", "").lower()
-
-            # Só processa se parecer e-mail do ZAP
-            e_zap = any(t in from_h or t in subject_h or t in snippet for t in termos_zap)
-            if not e_zap:
-                return None
-
-            corpo = _extrair_corpo_email(msg)
-            print(f"   📄 E-mail: de='{from_h[:50]}' assunto='{subject_h[:60]}'")
-            print(f"   📄 Corpo (200 chars): {corpo[:200]}")
-
-            for padrao in padroes_especificos:
-                m = re.search(padrao, corpo, re.IGNORECASE)
-                if m:
-                    return m.group(1)
-
-            # Fallback: qualquer sequência de 6 dígitos no corpo
-            m = re.search(r"\b(\d{6})\b", corpo)
-            if m:
-                return m.group(1)
-
-        except Exception as exc:
-            print(f"   ⚠️ Erro ao processar e-mail: {exc}")
-        return None
 
     try:
         minutos = max(2, janela_segundos // 60)
 
-        # Queries em ordem de especificidade
         queries = [
             f'subject:"confirmação" newer_than:{minutos}m',
             f'subject:"confirmacao" newer_than:{minutos}m',
@@ -1006,15 +971,55 @@ def _gmail_buscar_codigo_2fa(service, janela_segundos=300):
             f'from:zap newer_than:{minutos}m',
         ]
 
+        # Coleta todas as mensagens candidatas das queries
+        ids_vistos = set()
+        mensagens_refs = []
         for query in queries:
             resultado = service.users().messages().list(
-                userId="me", q=query, maxResults=5
+                userId="me", q=query, maxResults=10
             ).execute()
             for msg_ref in resultado.get("messages", []):
-                codigo = _tentar_extrair(msg_ref)
-                if codigo:
-                    print(f"✅ Código 2FA encontrado: {codigo}")
-                    return codigo
+                if msg_ref["id"] not in ids_vistos:
+                    ids_vistos.add(msg_ref["id"])
+                    mensagens_refs.append(msg_ref)
+
+        if not mensagens_refs:
+            return None
+
+        # Busca detalhes de todas para comparar datas
+        msgs_com_data = []
+        for msg_ref in mensagens_refs:
+            try:
+                msg = service.users().messages().get(
+                    userId="me", id=msg_ref["id"], format="full"
+                ).execute()
+                internal_date = int(msg.get("internalDate", 0))
+                msgs_com_data.append((internal_date, msg))
+            except Exception:
+                pass
+
+        if not msgs_com_data:
+            return None
+
+        # Ordena da mais recente para a mais antiga e pega apenas a primeira
+        msgs_com_data.sort(key=lambda x: x[0], reverse=True)
+        data_ts, msg_mais_recente = msgs_com_data[0]
+
+        data_email = datetime.fromtimestamp(data_ts / 1000).strftime("%H:%M:%S")
+        headers = {h["name"].lower(): h["value"]
+                   for h in msg_mais_recente.get("payload", {}).get("headers", [])}
+        print(f"   📧 E-mail mais recente: {data_email} | de='{headers.get('from','')[:50]}'"
+              f" | assunto='{headers.get('subject','')[:60]}'")
+
+        corpo = _extrair_corpo_email(msg_mais_recente)
+        print(f"   📄 Corpo (200 chars): {corpo[:200]}")
+
+        for padrao in padroes:
+            m = re.search(padrao, corpo, re.IGNORECASE)
+            if m:
+                codigo = m.group(1)
+                print(f"✅ Código 2FA encontrado: {codigo}")
+                return codigo
 
         return None
 
