@@ -1,9 +1,14 @@
-import email
-import imaplib
+import base64
 import json
 import os
-from datetime import datetime, timedelta
+import re
+from datetime import datetime, timedelta, timezone
 import time
+
+from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import InstalledAppFlow
+from googleapiclient.discovery import build
 
 from dotenv import load_dotenv
 from selenium import webdriver
@@ -30,7 +35,9 @@ VIVAREAL_VALUE = "9"
 # === CONFIGURACOES CANAL PRO ===
 CANALPRO_EMAIL = os.environ["CANALPRO_EMAIL"]
 CANALPRO_SENHA = os.environ["CANALPRO_SENHA"]
-GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD", "").replace(" ", "")
+GMAIL_CREDENTIALS_FILE = "gmail_credentials.json"
+GMAIL_TOKEN_FILE       = "gmail_token.json"
+GMAIL_SCOPES           = ["https://www.googleapis.com/auth/gmail.readonly"]
 CANAL_PRO_URL_LOGIN    = "https://canalpro.grupozap.com/login"
 CANAL_PRO_URL_LISTINGS = "https://canalpro.grupozap.com/ZAP_OLX/0/listings"
 VERIFICACAO_INTERVALO_SEGUNDOS = 600   # 10 minutos entre verificações
@@ -888,85 +895,108 @@ def process_part_1_collect_and_disable_vivareal():
 # PARTE INTERMEDIÁRIA — VERIFICAÇÃO NO CANAL PRO (ZAP IMÓVEIS)
 # =============================================================================
 
-def _get_2fa_code_from_gmail(timeout_seconds=180):
+def _gmail_autenticar():
     """
-    Conecta ao Gmail via IMAP e extrai o código 2FA do Canal Pro do e-mail mais recente.
-    Aguarda até `timeout_seconds` para o e-mail chegar. Retorna string de 6 dígitos.
+    Autentica na Gmail API via OAuth2. Na primeira execução abre o browser
+    para o usuário autorizar com mkmarcoslopes@gmail.com. Nas seguintes
+    usa o token salvo em gmail_token.json automaticamente.
     """
-    import re as _re
-    from email.header import decode_header as _decode_header
+    creds = None
 
-    print("📧 Conectando ao Gmail para buscar código 2FA automaticamente...")
+    if os.path.exists(GMAIL_TOKEN_FILE):
+        creds = Credentials.from_authorized_user_file(GMAIL_TOKEN_FILE, GMAIL_SCOPES)
 
-    deadline = time.time() + timeout_seconds
-    attempt = 1
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        else:
+            print("🌐 Abrindo browser para autorização OAuth do Gmail...")
+            print("   Faça login com mkmarcoslopes@gmail.com e autorize o acesso.")
+            flow = InstalledAppFlow.from_client_secrets_file(GMAIL_CREDENTIALS_FILE, GMAIL_SCOPES)
+            creds = flow.run_local_server(port=0)
 
-    while time.time() < deadline:
-        try:
-            mail = imaplib.IMAP4_SSL("imap.gmail.com")
-            mail.login(CANALPRO_EMAIL, GMAIL_APP_PASSWORD)
-            mail.select("INBOX")
+        with open(GMAIL_TOKEN_FILE, "w") as token:
+            token.write(creds.to_json())
 
-            # Busca e-mails não lidos dos últimos 10 minutos
-            _, ids = mail.search(None, "UNSEEN")
-            id_list = ids[0].split()
+    return build("gmail", "v1", credentials=creds)
 
-            for msg_id in reversed(id_list):  # mais recente primeiro
-                _, msg_data = mail.fetch(msg_id, "(RFC822)")
-                raw = msg_data[0][1]
-                msg = email.message_from_bytes(raw)
 
-                from_addr = (msg.get("From") or "").lower()
-                subject_raw = msg.get("Subject") or ""
-                try:
-                    subject = str(_decode_header(subject_raw)[0][0])
-                except Exception:
-                    subject = subject_raw
-                subject = subject.lower()
+def _extrair_corpo_email(msg):
+    """Extrai texto do corpo do e-mail (suporta plain text, html e multipart aninhado)."""
+    try:
+        payload = msg.get("payload", {})
 
-                # Filtra por remetente/assunto do Canal Pro / ZAP / OLX
-                termos = ["grupozap", "canalpro", "canal pro", "zap", "olx",
-                          "vivareal", "código", "codigo", "verification", "acesso"]
-                if not any(t in from_addr or t in subject for t in termos):
-                    continue
+        if "body" in payload and payload["body"].get("data"):
+            data = payload["body"]["data"]
+            return base64.urlsafe_b64decode(data).decode("utf-8", errors="ignore")
 
-                # Extrai texto do corpo
-                body = ""
-                if msg.is_multipart():
-                    for part in msg.walk():
-                        ct = part.get_content_type()
-                        if ct in ("text/plain", "text/html"):
-                            try:
-                                body += part.get_payload(decode=True).decode(errors="ignore")
-                            except Exception:
-                                pass
-                else:
-                    try:
-                        body = msg.get_payload(decode=True).decode(errors="ignore")
-                    except Exception:
-                        body = str(msg.get_payload())
+        parts = payload.get("parts", [])
+        for part in parts:
+            mime = part.get("mimeType", "")
+            if mime in ("text/plain", "text/html"):
+                data = part.get("body", {}).get("data", "")
+                if data:
+                    return base64.urlsafe_b64decode(data).decode("utf-8", errors="ignore")
+            for sub in part.get("parts", []):
+                data = sub.get("body", {}).get("data", "")
+                if data:
+                    return base64.urlsafe_b64decode(data).decode("utf-8", errors="ignore")
 
-                # Extrai código de 6 dígitos
-                match = _re.search(r"\b(\d{6})\b", body)
+        return msg.get("snippet", "")
+    except Exception:
+        return msg.get("snippet", "")
+
+
+def _gmail_buscar_codigo_2fa(service, janela_segundos=300):
+    """
+    Busca o código 2FA do Canal Pro nos e-mails recentes via Gmail API.
+    Retorna string de 6 dígitos ou None se não encontrado.
+    """
+    try:
+        agora = datetime.now(timezone.utc)
+        corte_epoch = int(agora.timestamp()) - janela_segundos
+
+        query = (
+            f"from:zap after:{corte_epoch} "
+            f"subject:confirmação OR subject:codigo OR subject:código"
+        )
+
+        resultado = service.users().messages().list(
+            userId="me", q=query, maxResults=5
+        ).execute()
+
+        mensagens = resultado.get("messages", [])
+        if not mensagens:
+            return None
+
+        padroes = [
+            r"confirmar:\s*(\d{6})",
+            r"código[:\s]+(\d{6})",
+            r"codigo[:\s]+(\d{6})",
+            r"\b(\d{6})\b",
+        ]
+
+        for msg_ref in mensagens:
+            msg = service.users().messages().get(
+                userId="me", id=msg_ref["id"], format="full"
+            ).execute()
+
+            corpo = _extrair_corpo_email(msg)
+            if not corpo:
+                continue
+
+            for padrao in padroes:
+                match = re.search(padrao, corpo, re.IGNORECASE)
                 if match:
-                    code = match.group(1)
-                    mail.store(msg_id, "+FLAGS", "\\Seen")
-                    mail.logout()
-                    print(f"✅ Código 2FA encontrado: {code}")
-                    return code
+                    codigo = match.group(1)
+                    print(f"✅ Código 2FA encontrado: {codigo}")
+                    return codigo
 
-            mail.logout()
+        return None
 
-        except Exception as exc:
-            print(f"   ⚠️ Erro ao acessar Gmail: {type(exc).__name__} | {exc}")
-
-        remaining = int(deadline - time.time())
-        if remaining > 0:
-            print(f"   ⏳ Código não encontrado ainda. Próxima tentativa em 10s... ({remaining}s restantes)")
-            time.sleep(10)
-            attempt += 1
-
-    raise Exception(f"Código 2FA não encontrado no Gmail após {timeout_seconds}s")
+    except Exception as exc:
+        print(f"⚠️ Erro ao buscar código no Gmail: {type(exc).__name__} | {repr(exc)}")
+        return None
 
 
 def _canal_pro_handle_cookie_popup():
@@ -1248,149 +1278,141 @@ def _canal_pro_aguardar_pos_login():
         return None
 
 
-def _canal_pro_handle_2fa():
-    """
-    Trata autenticação em dois fatores do Canal Pro de forma totalmente automática.
-    Lê o código diretamente do Gmail via IMAP usando a App Password configurada.
-    O Canal Pro exige 2FA quando detecta um 'novo dispositivo' (perfil Chrome sem
-    cookies persistentes da sessão anterior).
-    """
-    print("\n🔐 Autenticação 2FA detectada — buscando código no Gmail automaticamente...")
-
-    # PASSO 1 — Buscar código automaticamente no Gmail
-    codigo_limpo = _get_2fa_code_from_gmail(timeout_seconds=180)
-
-    # PASSO 2 — Localizar os 6 campos do código
-    print("📝 Localizando os 6 campos do código...")
-    inputs = []
-    for locator in [
-        "input[maxlength='1']",
-        "input[type='tel'], input[type='number']",
-        "input[class*='otp'], input[class*='code'], input[class*='pin'], input[class*='digit']",
-    ]:
-        try:
-            found = driver.find_elements(By.CSS_SELECTOR, locator)
-            found = [el for el in found if el.is_displayed()]
-            if len(found) >= 6:
-                inputs = found[:6]
-                break
-        except Exception:
-            pass
-
-    if len(inputs) < 6:
-        # CAMADA D — container com texto relacionado ao código
-        try:
-            container = driver.find_element(
-                By.XPATH,
-                "//*[contains(normalize-space(.), 'informe o código') or "
-                "contains(normalize-space(.), 'Acesso em um novo dispositivo')]"
-                "/ancestor::div[3]"
-            )
-            found = container.find_elements(By.TAG_NAME, "input")
-            found = [el for el in found if el.is_displayed()]
-            if len(found) >= 6:
-                inputs = found[:6]
-        except Exception:
-            pass
-
-    if len(inputs) < 6:
-        html_parcial = driver.execute_script("return document.body.innerHTML.slice(0, 5000);")
-        print("⚠️ Não consegui localizar os 6 campos do código 2FA.")
-        print("HTML parcial para diagnóstico:")
-        print(html_parcial[:2000])
-        raise Exception("2FA: 6 campos de código não encontrados")
-
-    # PASSO 3 — Preencher os campos
-    print("📝 Preenchendo dígitos...")
-
-    # Tenta auto-tab: envia tudo pelo primeiro campo
-    preenchido = False
-    try:
-        inputs[0].click()
-        inputs[0].send_keys(codigo_limpo)
-        time.sleep(0.5)
-        valores = [(inp.get_attribute("value") or "").strip() for inp in inputs]
-        if "".join(valores) == codigo_limpo:
-            print("✅ Código preenchido via auto-tab.")
-            preenchido = True
-    except Exception:
-        pass
-
-    if not preenchido:
-        for i, digito in enumerate(codigo_limpo):
-            campo = inputs[i]
-            try:
-                campo.clear()
-            except Exception:
-                driver.execute_script("arguments[0].value = '';", campo)
-
-            try:
-                campo.send_keys(digito)
-                time.sleep(0.15)
-                if (campo.get_attribute("value") or "").strip() == digito:
-                    continue
-            except Exception:
-                pass
-
-            driver.execute_script(
-                "arguments[0].focus();"
-                "arguments[0].value = arguments[1];"
-                "arguments[0].dispatchEvent(new Event('input', {bubbles: true}));"
-                "arguments[0].dispatchEvent(new Event('change', {bubbles: true}));",
-                campo, digito
-            )
-            time.sleep(0.15)
-
-    # PASSO 4 — Clicar em "Verificar código"
-    print("🖱️ Clicando em 'Verificar código'...")
-    btn = None
-    for locator in [
+def _canal_pro_clicar_verificar_codigo():
+    """Clica em 'Verificar código' e aguarda o redirecionamento pós-2FA."""
+    for by, seletor in [
         (By.XPATH, "//button[normalize-space(text())='Verificar código']"),
         (By.XPATH, "//button[contains(normalize-space(.), 'Verificar')]"),
         (By.CSS_SELECTOR, "button[type='submit']"),
     ]:
         try:
-            btn = driver.find_element(*locator)
-            break
-        except Exception:
-            pass
-
-    if btn:
-        for _ in range(2):
+            btn = WebDriverWait(driver, 5).until(EC.element_to_be_clickable((by, seletor)))
             try:
-                safe_click(btn)
-                break
+                btn.click()
             except Exception:
-                try:
-                    driver.execute_script("arguments[0].click();", btn)
-                    break
-                except Exception:
-                    time.sleep(1)
-    else:
-        inputs[-1].send_keys(Keys.RETURN)
-
-    # PASSO 5 — Aguardar redirecionamento pós-2FA
-    print("⏳ Aguardando redirecionamento pós-2FA...")
-    try:
-        WebDriverWait(driver, 25).until(
-            lambda d: "performance/home" in d.current_url or "listings" in d.current_url
-        )
-    except TimeoutException:
-        msgs = []
-        try:
-            erros = driver.find_elements(
-                By.XPATH,
-                "//*[contains(text(),'inválido') or contains(text(),'incorreto') "
-                "or contains(text(),'expirado') or contains(text(),'erro')]"
+                driver.execute_script("arguments[0].click();", btn)
+            print("🖱️ Botão 'Verificar código' clicado.")
+            WebDriverWait(driver, 25).until(
+                lambda d: "performance/home" in d.current_url or "listings" in d.current_url
             )
-            msgs = [e.text for e in erros if e.is_displayed() and e.text.strip()]
+            print("✅ Código 2FA validado. Login no Canal Pro concluído.")
+            return
+        except Exception:
+            continue
+    raise Exception("2FA: não foi possível clicar em 'Verificar código' ou aguardar redirecionamento.")
+
+
+def _canal_pro_preencher_codigo_2fa(codigo):
+    """Localiza os 6 campos do código 2FA e preenche dígito a dígito."""
+    print(f"📝 Preenchendo código 2FA: {codigo}")
+    inputs = []
+
+    for seletor, nome in [
+        ("input[maxlength='1']", "maxlength=1"),
+        ("input[type='tel']", "type=tel"),
+        ("input[type='number']", "type=number"),
+        ("input[class*='otp'], input[class*='code'], input[class*='pin']", "otp/code/pin"),
+    ]:
+        try:
+            found = driver.find_elements(By.CSS_SELECTOR, seletor)
+            visiveis = [el for el in found if el.is_displayed()]
+            if len(visiveis) >= 6:
+                inputs = visiveis[:6]
+                print(f"   ✅ Campos encontrados via: {nome}")
+                break
+        except Exception:
+            continue
+
+    if not inputs:
+        try:
+            primeiro = WebDriverWait(driver, 10).until(
+                EC.presence_of_element_located(
+                    (By.XPATH, "//input[@maxlength='1' or @type='tel' or @type='number']")
+                )
+            )
+            inputs = [primeiro]
         except Exception:
             pass
-        if msgs:
-            print(f"   Mensagens de erro: {msgs}")
-        raise Exception(f"2FA: redirecionamento não ocorreu. URL atual: {driver.current_url}")
 
-    print("✅ Código 2FA validado. Login no Canal Pro concluído.")
+    if not inputs:
+        html = driver.execute_script("return document.body.innerHTML.slice(0, 5000);")
+        print("⚠️ Campos do código 2FA não encontrados. HTML parcial:")
+        print(html[:2000])
+        raise Exception("2FA: campos de código não encontrados.")
+
+    # Tenta auto-tab (envia código completo no primeiro campo)
+    try:
+        inputs[0].click()
+        inputs[0].send_keys(codigo)
+        time.sleep(0.5)
+        if len(inputs) >= 6:
+            valores = "".join((inp.get_attribute("value") or "").strip() for inp in inputs)
+            if valores == codigo:
+                print("✅ Código preenchido via auto-tab.")
+                _canal_pro_clicar_verificar_codigo()
+                return
+    except Exception:
+        pass
+
+    # Preenche dígito a dígito
+    for i, digito in enumerate(codigo):
+        if i >= len(inputs):
+            break
+        campo = inputs[i]
+        try:
+            campo.clear()
+            campo.send_keys(digito)
+            time.sleep(0.15)
+        except Exception:
+            driver.execute_script(
+                "arguments[0].focus();"
+                "arguments[0].value = arguments[1];"
+                "arguments[0].dispatchEvent(new Event('input', {bubbles:true}));"
+                "arguments[0].dispatchEvent(new Event('change', {bubbles:true}));",
+                campo, digito
+            )
+            time.sleep(0.15)
+
+    print("✅ Código preenchido dígito a dígito.")
+    _canal_pro_clicar_verificar_codigo()
+
+
+def _canal_pro_handle_2fa():
+    """
+    Trata autenticação 2FA do Canal Pro via Gmail API OAuth2.
+    Busca automaticamente o código de 6 dígitos no e-mail enviado pelo Zap.
+    Na primeira execução abre o browser para autorização OAuth (único setup manual).
+    """
+    print("🔐 Autenticação 2FA detectada — buscando código no Gmail...")
+
+    print("📧 Autenticando Gmail API...")
+    try:
+        gmail_service = _gmail_autenticar()
+        print("✅ Gmail API autenticado.")
+    except Exception as exc:
+        raise Exception(f"Falha ao autenticar Gmail API: {repr(exc)}")
+
+    TIMEOUT_SEGUNDOS  = 180
+    INTERVALO_SEGUNDOS = 10
+    inicio = time.time()
+    tentativa = 0
+
+    while time.time() - inicio < TIMEOUT_SEGUNDOS:
+        tentativa += 1
+        restante = int(TIMEOUT_SEGUNDOS - (time.time() - inicio))
+        print(f"   🔍 Tentativa #{tentativa} — buscando código 2FA... ({restante}s restantes)")
+
+        janela = int(time.time() - inicio) + 30
+        codigo = _gmail_buscar_codigo_2fa(gmail_service, janela_segundos=max(janela, 60))
+
+        if codigo and len(codigo) == 6 and codigo.isdigit():
+            print(f"✅ Código 2FA obtido automaticamente: {codigo}")
+            _canal_pro_preencher_codigo_2fa(codigo)
+            return
+
+        time.sleep(INTERVALO_SEGUNDOS)
+
+    raise Exception(f"Código 2FA não encontrado no Gmail após {TIMEOUT_SEGUNDOS}s")
 
 
 def _canal_pro_navigate_to_listings():
