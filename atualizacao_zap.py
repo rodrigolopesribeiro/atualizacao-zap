@@ -922,76 +922,97 @@ def _gmail_autenticar():
 
 
 def _extrair_corpo_email(msg):
-    """Extrai texto do corpo do e-mail (suporta plain text, html e multipart aninhado)."""
+    """Extrai todo o texto do e-mail percorrendo recursivamente as partes."""
+    textos = []
+
+    def _decode(data):
+        try:
+            return base64.urlsafe_b64decode(data + "==").decode("utf-8", errors="ignore")
+        except Exception:
+            return ""
+
+    def _coletar(parte):
+        data = parte.get("body", {}).get("data", "")
+        if data:
+            textos.append(_decode(data))
+        for sub in parte.get("parts", []):
+            _coletar(sub)
+
     try:
         payload = msg.get("payload", {})
-
-        if "body" in payload and payload["body"].get("data"):
-            data = payload["body"]["data"]
-            return base64.urlsafe_b64decode(data).decode("utf-8", errors="ignore")
-
-        parts = payload.get("parts", [])
-        for part in parts:
-            mime = part.get("mimeType", "")
-            if mime in ("text/plain", "text/html"):
-                data = part.get("body", {}).get("data", "")
-                if data:
-                    return base64.urlsafe_b64decode(data).decode("utf-8", errors="ignore")
-            for sub in part.get("parts", []):
-                data = sub.get("body", {}).get("data", "")
-                if data:
-                    return base64.urlsafe_b64decode(data).decode("utf-8", errors="ignore")
-
-        return msg.get("snippet", "")
+        _coletar(payload)
     except Exception:
-        return msg.get("snippet", "")
+        pass
+
+    return "\n".join(textos) or msg.get("snippet", "")
 
 
 def _gmail_buscar_codigo_2fa(service, janela_segundos=300):
     """
     Busca o código 2FA do Canal Pro nos e-mails recentes via Gmail API.
-    Retorna string de 6 dígitos ou None se não encontrado.
+    Só retorna código se vier de e-mail claramente relacionado ao ZAP/Canal Pro.
     """
-    try:
-        # newer_than aceita h (horas) ou m (minutos) — mais confiável que after:{epoch}
-        minutos = max(1, janela_segundos // 60)
-        query = f"subject:confirmação newer_than:{minutos}m"
+    padroes_especificos = [
+        r"confirmar[:\s]+(\d{6})",
+        r"código[:\s]+(\d{6})",
+        r"codigo[:\s]+(\d{6})",
+    ]
+    termos_zap = ["zap", "grupozap", "olx", "vivareal", "canal", "confirmação", "codigo"]
 
-        resultado = service.users().messages().list(
-            userId="me", q=query, maxResults=10
-        ).execute()
-
-        # Se não achou por assunto, tenta busca mais ampla pelo snippet
-        if not resultado.get("messages"):
-            query = f"newer_than:{minutos}m"
-            resultado = service.users().messages().list(
-                userId="me", q=query, maxResults=20
-            ).execute()
-
-        mensagens = resultado.get("messages", [])
-        if not mensagens:
-            return None
-
-        padroes = [
-            r"confirmar:\s*(\d{6})",
-            r"código[:\s]+(\d{6})",
-            r"codigo[:\s]+(\d{6})",
-            r"\b(\d{6})\b",
-        ]
-
-        for msg_ref in mensagens:
+    def _tentar_extrair(msg_ref):
+        try:
             msg = service.users().messages().get(
                 userId="me", id=msg_ref["id"], format="full"
             ).execute()
 
-            corpo = _extrair_corpo_email(msg)
-            if not corpo:
-                continue
+            headers = {h["name"].lower(): h["value"]
+                       for h in msg.get("payload", {}).get("headers", [])}
+            from_h    = headers.get("from", "").lower()
+            subject_h = headers.get("subject", "").lower()
+            snippet   = msg.get("snippet", "").lower()
 
-            for padrao in padroes:
-                match = re.search(padrao, corpo, re.IGNORECASE)
-                if match:
-                    codigo = match.group(1)
+            # Só processa se parecer e-mail do ZAP
+            e_zap = any(t in from_h or t in subject_h or t in snippet for t in termos_zap)
+            if not e_zap:
+                return None
+
+            corpo = _extrair_corpo_email(msg)
+            print(f"   📄 E-mail: de='{from_h[:50]}' assunto='{subject_h[:60]}'")
+            print(f"   📄 Corpo (200 chars): {corpo[:200]}")
+
+            for padrao in padroes_especificos:
+                m = re.search(padrao, corpo, re.IGNORECASE)
+                if m:
+                    return m.group(1)
+
+            # Fallback: qualquer sequência de 6 dígitos no corpo
+            m = re.search(r"\b(\d{6})\b", corpo)
+            if m:
+                return m.group(1)
+
+        except Exception as exc:
+            print(f"   ⚠️ Erro ao processar e-mail: {exc}")
+        return None
+
+    try:
+        minutos = max(2, janela_segundos // 60)
+
+        # Queries em ordem de especificidade
+        queries = [
+            f'subject:"confirmação" newer_than:{minutos}m',
+            f'subject:"confirmacao" newer_than:{minutos}m',
+            f'subject:"codigo" newer_than:{minutos}m',
+            f'from:grupozap newer_than:{minutos}m',
+            f'from:zap newer_than:{minutos}m',
+        ]
+
+        for query in queries:
+            resultado = service.users().messages().list(
+                userId="me", q=query, maxResults=5
+            ).execute()
+            for msg_ref in resultado.get("messages", []):
+                codigo = _tentar_extrair(msg_ref)
+                if codigo:
                     print(f"✅ Código 2FA encontrado: {codigo}")
                     return codigo
 
