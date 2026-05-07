@@ -1486,13 +1486,38 @@ def _canal_pro_navigate_to_listings():
 def _canal_pro_collect_all_active_codes():
     """
     Varre todas as páginas de anúncios do Canal Pro e retorna um set com
-    todos os códigos ativos. Retorna None se o resultado for inválido
-    (0 elementos sem confirmação de lista vazia).
+    todos os códigos ativos. Retorna None apenas se MAIS DE UMA página
+    diferente retornar 0 sem confirmação de lista vazia (proteção contra
+    falso positivo por renderização lenta do React).
     Anúncios com badge 'Bloqueado' ainda constam na listagem e são ATIVOS.
     """
     all_codes = set()
     page = 1
+    paginas_invalidas = 0
+    MAX_TENTATIVAS_PAGINA = 3
     wait_cards = WebDriverWait(driver, 15)
+
+    def _lista_vazia_confirmada():
+        try:
+            body_text = (driver.find_element(By.TAG_NAME, "body").text or "").lower()
+            if any(t in body_text for t in ["nenhum anúncio", "0 anúncios", "nenhum resultado", "sem anúncios"]):
+                return True
+            driver.find_element(By.XPATH, "//*[contains(normalize-space(.),'de 0')]")
+            return True
+        except Exception:
+            return False
+
+    def _coletar_codigos_pagina():
+        elements = driver.find_elements(By.CSS_SELECTOR, "span.card-content__tag")
+        codes = set()
+        for el in elements:
+            try:
+                code = (el.text or "").strip()
+                if code.isdigit():
+                    codes.add(code)
+            except Exception:
+                pass
+        return codes
 
     while True:
         # Aguarda cards ou mensagem de lista vazia
@@ -1507,39 +1532,36 @@ def _canal_pro_collect_all_active_codes():
         except Exception:
             time.sleep(3)
 
-        elements = driver.find_elements(By.CSS_SELECTOR, "span.card-content__tag")
+        # Tentativas por página para lidar com renderização lenta do React
         page_codes = set()
-        for el in elements:
-            try:
-                code = (el.text or "").strip()
-                if code.isdigit():
-                    page_codes.add(code)
-            except Exception:
-                pass
+        for tentativa_pag in range(1, MAX_TENTATIVAS_PAGINA + 1):
+            page_codes = _coletar_codigos_pagina()
 
-        # Validação anti-falso-positivo
-        if not page_codes:
-            body_text = (driver.find_element(By.TAG_NAME, "body").text or "").lower()
-            lista_vazia = any(t in body_text for t in [
-                "nenhum anúncio", "0 anúncios", "nenhum resultado", "sem anúncios"
-            ])
-            # Verifica contador "0 - 0 de 0" ou similar
-            try:
-                contador = driver.find_element(
-                    By.XPATH,
-                    "//*[contains(normalize-space(.),'de 0') or normalize-space(.)='0']"
-                )
-                lista_vazia = lista_vazia or bool(contador)
-            except Exception:
-                pass
+            if page_codes:
+                break  # sucesso
 
-            if not lista_vazia:
-                print(f"   ⚠️ AVISO: Página {page} retornou 0 códigos sem confirmação de lista vazia. Dado inválido.")
-                return None
+            if _lista_vazia_confirmada():
+                break  # lista realmente vazia, aceitar 0
+
+            if tentativa_pag < MAX_TENTATIVAS_PAGINA:
+                print(f"   ⚠️ Página {page} retornou 0 códigos (tentativa {tentativa_pag}/{MAX_TENTATIVAS_PAGINA}). Aguardando 3s...")
+                time.sleep(3)
+                driver.execute_script("window.scrollTo(0, 300);")
+                time.sleep(1)
+                driver.execute_script("window.scrollTo(0, 0);")
+                time.sleep(1)
+            else:
+                print(f"   ⚠️ Página {page} retornou 0 códigos após {MAX_TENTATIVAS_PAGINA} tentativas. Pulando página.")
+                paginas_invalidas += 1
 
         sorted_codes = sorted(page_codes)
         print(f"   📄 Página {page}: {len(page_codes)} código(s) coletado(s): {sorted_codes}")
         all_codes.update(page_codes)
+
+        # Só invalida o resultado inteiro se mais de uma página diferente falhou
+        if paginas_invalidas > 1:
+            print("   ⚠️ AVISO: Múltiplas páginas retornaram 0 códigos sem confirmação. Dado inválido.")
+            return None
 
         # Verifica próxima página
         try:
