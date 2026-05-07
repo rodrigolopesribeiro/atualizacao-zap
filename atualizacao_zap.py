@@ -2,7 +2,7 @@ import base64
 import json
 import os
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 import time
 
 from google.auth.transport.requests import Request
@@ -953,17 +953,20 @@ def _gmail_buscar_codigo_2fa(service, janela_segundos=300):
     Retorna string de 6 dígitos ou None se não encontrado.
     """
     try:
-        agora = datetime.now(timezone.utc)
-        corte_epoch = int(agora.timestamp()) - janela_segundos
-
-        query = (
-            f"from:zap after:{corte_epoch} "
-            f"subject:confirmação OR subject:codigo OR subject:código"
-        )
+        # newer_than aceita h (horas) ou m (minutos) — mais confiável que after:{epoch}
+        minutos = max(1, janela_segundos // 60)
+        query = f"subject:confirmação newer_than:{minutos}m"
 
         resultado = service.users().messages().list(
-            userId="me", q=query, maxResults=5
+            userId="me", q=query, maxResults=10
         ).execute()
+
+        # Se não achou por assunto, tenta busca mais ampla pelo snippet
+        if not resultado.get("messages"):
+            query = f"newer_than:{minutos}m"
+            resultado = service.users().messages().list(
+                userId="me", q=query, maxResults=20
+            ).execute()
 
         mensagens = resultado.get("messages", [])
         if not mensagens:
