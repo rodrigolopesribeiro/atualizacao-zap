@@ -40,7 +40,7 @@ GMAIL_TOKEN_FILE       = "gmail_token.json"
 GMAIL_SCOPES           = ["https://www.googleapis.com/auth/gmail.readonly"]
 CANAL_PRO_URL_LOGIN    = "https://canalpro.grupozap.com/login"
 CANAL_PRO_URL_LISTINGS = "https://canalpro.grupozap.com/ZAP_OLX/0/listings"
-VERIFICACAO_INTERVALO_SEGUNDOS = 600   # 10 minutos entre verificações
+VERIFICACAO_INTERVALO_SEGUNDOS = 1800  # 30 minutos entre verificações
 VERIFICACAO_TIMEOUT_SEGUNDOS   = 8 * 3600  # timeout máximo de 8 horas
 # Aliases para compatibilidade
 CANALPRO_LOGIN_URL = CANAL_PRO_URL_LOGIN
@@ -59,7 +59,7 @@ CATEGORIAS_VIVAREAL = {
 
 # ⚠️ APENAS PARA TESTE — voltar para False em execuções normais de produção
 # Quando True: pula a Parte 1, lê imoveis_parte1.json e começa na Parte Intermediária
-MODO_PULAR_PARTE_1 = True
+MODO_PULAR_PARTE_1 = False
 
 # Inicializados dentro de main() após wait_until_10am()
 driver = None
