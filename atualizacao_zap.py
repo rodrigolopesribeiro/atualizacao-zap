@@ -10,6 +10,13 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 
+# Importa seleniumwire se disponível (usado para proxy com autenticação)
+try:
+    from seleniumwire import webdriver as sw_webdriver
+    SELENIUMWIRE_DISPONIVEL = True
+except ImportError:
+    SELENIUMWIRE_DISPONIVEL = False
+
 from dotenv import load_dotenv
 from selenium import webdriver
 from selenium.common.exceptions import InvalidSessionIdException, TimeoutException, WebDriverException
@@ -61,6 +68,13 @@ CATEGORIAS_VIVAREAL = {
 # Quando True: pula a Parte 1, lê imoveis_parte1.json e começa na Parte Intermediária
 MODO_PULAR_PARTE_1 = False
 MODO_HEADLESS = os.getenv("MODO_HEADLESS", "false").lower() == "true"
+
+# === CONFIGURACOES PROXY WEBSHARE (Brasil) ===
+PROXY_ATIVO  = os.getenv("PROXY_ATIVO", "false").lower() == "true"
+PROXY_HOST   = "p.webshare.io"
+PROXY_PORTA  = "80"
+PROXY_USUARIO = os.getenv("PROXY_USUARIO", "jecuapfw-br-1")
+PROXY_SENHA  = os.getenv("PROXY_SENHA", "8a7gx6ckzexa")
 
 # Inicializados dentro de main() após wait_until_10am()
 driver = None
@@ -1804,7 +1818,27 @@ def main():
     else:
         options.add_argument("--start-maximized")
 
-    driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
+    chrome_service = Service(ChromeDriverManager().install())
+
+    if PROXY_ATIVO and SELENIUMWIRE_DISPONIVEL:
+        print(f"🌐 Proxy ativo: {PROXY_HOST}:{PROXY_PORTA} (Brasil)")
+        sw_options = {
+            "proxy": {
+                "http":  f"http://{PROXY_USUARIO}:{PROXY_SENHA}@{PROXY_HOST}:{PROXY_PORTA}",
+                "https": f"http://{PROXY_USUARIO}:{PROXY_SENHA}@{PROXY_HOST}:{PROXY_PORTA}",
+                "no_proxy": "localhost,127.0.0.1",
+            }
+        }
+        driver = sw_webdriver.Chrome(
+            service=chrome_service,
+            options=options,
+            seleniumwire_options=sw_options,
+        )
+    else:
+        if PROXY_ATIVO and not SELENIUMWIRE_DISPONIVEL:
+            print("⚠️ PROXY_ATIVO=true mas seleniumwire não instalado — rodando sem proxy.")
+        driver = webdriver.Chrome(service=chrome_service, options=options)
+
     wait = WebDriverWait(driver, 30)
     actions = ActionChains(driver)
 
