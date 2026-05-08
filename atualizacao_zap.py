@@ -60,6 +60,7 @@ CATEGORIAS_VIVAREAL = {
 # ⚠️ APENAS PARA TESTE — voltar para False em execuções normais de produção
 # Quando True: pula a Parte 1, lê imoveis_parte1.json e começa na Parte Intermediária
 MODO_PULAR_PARTE_1 = False
+MODO_HEADLESS = os.getenv("MODO_HEADLESS", "false").lower() == "true"
 
 # Inicializados dentro de main() após wait_until_10am()
 driver = None
@@ -1794,7 +1795,7 @@ def main():
     options.add_argument("--disable-popup-blocking")
     options.add_argument("--disable-gpu")
 
-    if em_nuvem:
+    if em_nuvem or MODO_HEADLESS:
         # Modo headless para rodar em servidor Linux sem interface gráfica
         options.add_argument("--headless=new")
         options.add_argument("--no-sandbox")
