@@ -1761,16 +1761,16 @@ def process_part_2_restore_vivareal(imoveis_processados):
 # =============================================================================
 
 def wait_until_10am():
-    """Aguarda até as 10:00 h do dia atual (ou do próximo dia, se já passou)."""
+    """Aguarda até as 23:00 h do dia atual (ou do próximo dia, se já passou)."""
     now = datetime.now()
-    target = now.replace(hour=10, minute=0, second=0, microsecond=0)
+    target = now.replace(hour=23, minute=0, second=0, microsecond=0)
     if now >= target:
         target += timedelta(days=1)
     delta = (target - now).total_seconds()
     if delta > 0:
-        print(f"⏰ Aguardando até {target.strftime('%d/%m/%Y %H:%M:%S')} para iniciar a Parte 1...")
+        print(f"⏰ Aguardando até {target.strftime('%d/%m/%Y %H:%M:%S')} para iniciar...")
         time.sleep(delta)
-    print("🕙 10:00 — iniciando Parte 1.")
+    print("🕙 23:00 — iniciando execução.")
 
 
 # =============================================================================
@@ -1787,7 +1787,7 @@ def main():
     if not em_nuvem and not teste_local:
         wait_until_10am()
     elif teste_local:
-        print("🧪 MODO TESTE: pulando espera das 10h.")
+        print("🧪 MODO TESTE: pulando espera das 23h.")
 
     options = Options()
     options.add_argument("--disable-notifications")

@@ -2,8 +2,8 @@ name: Atualização ZAP Imóveis
 
 on:
   schedule:
-    # 10:00 BRT (UTC-3) — segunda a sexta
-    - cron: '0 13 * * 1-5'
+    # 23:00 BRT (UTC-3) = 02:00 UTC — todo dia
+    - cron: '0 2 * * *'
   workflow_dispatch:
     # Permite disparar manualmente pelo GitHub (botão "Run workflow")
 
