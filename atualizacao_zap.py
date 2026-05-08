@@ -10,12 +10,8 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 
-# Importa seleniumwire se disponível (usado para proxy com autenticação)
-try:
-    from seleniumwire import webdriver as sw_webdriver
-    SELENIUMWIRE_DISPONIVEL = True
-except ImportError:
-    SELENIUMWIRE_DISPONIVEL = False
+import tempfile
+import zipfile
 
 from dotenv import load_dotenv
 from selenium import webdriver
@@ -1772,6 +1768,55 @@ def process_part_2_restore_vivareal(imoveis_processados):
 
 
 # =============================================================================
+# PROXY
+# =============================================================================
+
+def _criar_extensao_proxy_auth(host, porta, usuario, senha):
+    """
+    Cria uma extensão Chrome temporária que injeta as credenciais do proxy
+    automaticamente. Necessário porque Chrome não aceita user:pass na URL do
+    proxy via linha de comando — a extensão responde ao evento onAuthRequired.
+    """
+    manifest = json.dumps({
+        "version": "1.0.0",
+        "manifest_version": 2,
+        "name": "Proxy Auth",
+        "permissions": [
+            "proxy", "tabs", "unlimitedStorage", "storage",
+            "<all_urls>", "webRequest", "webRequestBlocking"
+        ],
+        "background": {"scripts": ["background.js"]},
+        "minimum_chrome_version": "22.0.0"
+    })
+
+    background = f"""
+var config = {{
+    mode: "fixed_servers",
+    rules: {{
+        singleProxy: {{ scheme: "http", host: "{host}", port: parseInt({porta}) }},
+        bypassList: ["localhost", "127.0.0.1"]
+    }}
+}};
+chrome.proxy.settings.set({{value: config, scope: "regular"}}, function(){{}});
+
+chrome.webRequest.onAuthRequired.addListener(
+    function(details) {{
+        return {{ authCredentials: {{ username: "{usuario}", password: "{senha}" }} }};
+    }},
+    {{urls: ["<all_urls>"]}},
+    ["blocking"]
+);
+"""
+
+    ext_path = os.path.join(tempfile.gettempdir(), "proxy_auth_ext.zip")
+    with zipfile.ZipFile(ext_path, "w") as zf:
+        zf.writestr("manifest.json", manifest)
+        zf.writestr("background.js", background)
+
+    return ext_path
+
+
+# =============================================================================
 # AGENDAMENTO
 # =============================================================================
 
@@ -1820,25 +1865,13 @@ def main():
 
     chrome_service = Service(ChromeDriverManager().install())
 
-    if PROXY_ATIVO and SELENIUMWIRE_DISPONIVEL:
+    if PROXY_ATIVO:
         print(f"🌐 Proxy ativo: {PROXY_HOST}:{PROXY_PORTA} (Brasil)")
-        sw_options = {
-            "proxy": {
-                "http":  f"http://{PROXY_USUARIO}:{PROXY_SENHA}@{PROXY_HOST}:{PROXY_PORTA}",
-                "https": f"http://{PROXY_USUARIO}:{PROXY_SENHA}@{PROXY_HOST}:{PROXY_PORTA}",
-                "no_proxy": "localhost,127.0.0.1",
-            }
-        }
-        driver = sw_webdriver.Chrome(
-            service=chrome_service,
-            options=options,
-            seleniumwire_options=sw_options,
-        )
-    else:
-        if PROXY_ATIVO and not SELENIUMWIRE_DISPONIVEL:
-            print("⚠️ PROXY_ATIVO=true mas seleniumwire não instalado — rodando sem proxy.")
-        driver = webdriver.Chrome(service=chrome_service, options=options)
+        options.add_argument(f"--proxy-server=http://{PROXY_HOST}:{PROXY_PORTA}")
+        ext_path = _criar_extensao_proxy_auth(PROXY_HOST, PROXY_PORTA, PROXY_USUARIO, PROXY_SENHA)
+        options.add_extension(ext_path)
 
+    driver = webdriver.Chrome(service=chrome_service, options=options)
     wait = WebDriverWait(driver, 30)
     actions = ActionChains(driver)
 
