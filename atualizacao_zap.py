@@ -64,6 +64,11 @@ CATEGORIAS_VIVAREAL = {
 # Quando True: pula a Parte 1, lê imoveis_parte1.json e começa na Parte Intermediária
 MODO_PULAR_PARTE_1 = False
 MODO_HEADLESS = os.getenv("MODO_HEADLESS", "false").lower() == "true"
+DRY_RUN       = os.getenv("DRY_RUN",  "false").lower() == "true"
+SAFE_MODE     = os.getenv("SAFE_MODE", "false").lower() == "true"
+
+CHECKPOINT_DIR = "state"
+os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
 # === CONFIGURACOES PROXY WEBSHARE (Brasil) ===
 PROXY_ATIVO  = os.getenv("PROXY_ATIVO", "false").lower() == "true"
@@ -819,6 +824,123 @@ def go_to_integracoes_parceiros_and_update_vivareal():
 
 
 # =============================================================================
+# CHECKPOINT / ROLLBACK
+# =============================================================================
+
+_CHECKPOINT_PATH = None   # preenchido em _checkpoint_criar()
+
+def _checkpoint_criar(timestamp_str):
+    """Cria o arquivo de checkpoint no início da Parte 1."""
+    global _CHECKPOINT_PATH
+    fname = f"checkpoint_{timestamp_str}.json"
+    _CHECKPOINT_PATH = os.path.join(CHECKPOINT_DIR, fname)
+    data = {
+        "timestamp": timestamp_str,
+        "status": "IN_PROGRESS",
+        "desmarcados": [],
+    }
+    with open(_CHECKPOINT_PATH, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    print(f"📋 Checkpoint criado: {_CHECKPOINT_PATH}")
+    return _CHECKPOINT_PATH
+
+
+def _checkpoint_registrar_desmarcado(codigo, categoria_value, categoria_nome):
+    """Registra imediatamente cada imóvel desmarcado no checkpoint."""
+    if not _CHECKPOINT_PATH or not os.path.exists(_CHECKPOINT_PATH):
+        return
+    try:
+        with open(_CHECKPOINT_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        data["desmarcados"].append({
+            "codigo": codigo,
+            "categoria_vivareal": categoria_value,
+            "categoria_nome": categoria_nome,
+        })
+        with open(_CHECKPOINT_PATH, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as exc:
+        print(f"⚠️ Falha ao atualizar checkpoint: {exc}")
+
+
+def _checkpoint_fechar(status):
+    """Marca o checkpoint com o status final (SUCCESS, ERROR, etc.)."""
+    if not _CHECKPOINT_PATH or not os.path.exists(_CHECKPOINT_PATH):
+        return
+    try:
+        with open(_CHECKPOINT_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        data["status"] = status
+        data["fechado_em"] = datetime.now().isoformat()
+        with open(_CHECKPOINT_PATH, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+def _checkpoint_carregar_desmarcados():
+    """Retorna lista de imóveis desmarcados do checkpoint atual, ou [] se não houver."""
+    if not _CHECKPOINT_PATH or not os.path.exists(_CHECKPOINT_PATH):
+        return []
+    try:
+        with open(_CHECKPOINT_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data.get("desmarcados", [])
+    except Exception:
+        return []
+
+
+def _rollback_automatico(imoveis_para_reverter):
+    """
+    Tenta remarcar VivaReal para cada imóvel da lista.
+    Retorna (revertidos, pendentes).
+    """
+    if not imoveis_para_reverter:
+        return [], []
+
+    print(f"\n🔄 ROLLBACK AUTOMÁTICO: tentando restaurar {len(imoveis_para_reverter)} imóvel(is)...")
+    revertidos = []
+    pendentes  = []
+
+    for item in imoveis_para_reverter:
+        codigo = (item.get("codigo") or "").strip()
+        if not codigo:
+            continue
+        try:
+            from atualizacao_zap import _process_single_item_parte2  # self-import seguro
+        except Exception:
+            pass
+        try:
+            ok = _process_single_item_parte2(item)
+            if ok:
+                revertidos.append(item)
+                print(f"   ✅ Revertido: {codigo}")
+            else:
+                pendentes.append(item)
+                print(f"   ⚠️ Falhou: {codigo}")
+        except Exception as exc:
+            pendentes.append(item)
+            print(f"   ⚠️ Exceção ao reverter {codigo}: {exc}")
+
+    return revertidos, pendentes
+
+
+def _gerar_arquivo_rollback_pendente(pendentes, timestamp_str):
+    """Grava arquivo de pendências manuais se o rollback falhar parcialmente."""
+    if not pendentes:
+        return None
+    fname = os.path.join(CHECKPOINT_DIR, f"rollback_pendente_{timestamp_str}.json")
+    data = {
+        "gerado_em": datetime.now().isoformat(),
+        "instrucao": "Remarcar manualmente o VivaReal para os imóveis abaixo no CRM.",
+        "pendentes": pendentes,
+    }
+    with open(fname, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    return fname
+
+
+# =============================================================================
 # PARTE 1 — DESMARCAR VIVAREAL
 # =============================================================================
 
@@ -872,6 +994,7 @@ def process_part_1_collect_and_disable_vivareal():
                     codigos_ja_salvos.add(codigo)
 
                 save_property()
+                _checkpoint_registrar_desmarcado(codigo, categoria_value, categoria_nome)
                 print("💾 Imóvel salvo na Parte 1.")
                 time.sleep(1)
 
@@ -958,18 +1081,76 @@ def _extrair_corpo_email(msg):
     return "\n".join(textos) or msg.get("snippet", "")
 
 
-def _gmail_buscar_codigo_2fa(service, janela_segundos=300):
+def _gmail_buscar_codigo_2fa(service, janela_segundos=300, timestamp_inicio=None):
     """
-    Busca o código 2FA do Canal Pro nos e-mails recentes via Gmail API.
-    Ordena por internalDate e extrai o código APENAS do e-mail mais recente,
-    evitando pegar códigos antigos de tentativas anteriores.
+    Busca o código 2FA do Canal Pro com filtros fortes:
+    - Ignora remetentes de marketing/newsletter
+    - Exige assunto/conteúdo compatível com autenticação
+    - Aceita apenas e-mails recebidos APÓS o início do login 2FA
+    - Extrai código apenas perto de expressões de confirmação
+    Retorna string de 6 dígitos ou None (nunca retorna código duvidoso).
     """
-    padroes = [
-        r"confirmar[:\s]+(\d{6})",
-        r"código[:\s]+(\d{6})",
-        r"codigo[:\s]+(\d{6})",
-        r"\b(\d{6})\b",
+    # Remetentes/domínios de marketing a ignorar explicitamente
+    BLACKLIST_FROM = [
+        "novidades.zapimoveis.com.br",
+        "news@",
+        "newsletter",
+        "marketing",
+        "noreply@mail.",
+        "noreply@email.",
+        "ofertas@",
+        "promocao@",
+        "comunicacao@",
     ]
+    # Remetentes/domínios confiáveis para autenticação
+    WHITELIST_FROM = [
+        "grupozap", "canalpro", "canal-pro", "olx.com.br",
+        "zapimoveis.com.br", "vivareal.com", "olx.com",
+    ]
+    # Assuntos que indicam autenticação (ao menos um deve estar presente)
+    ASSUNTOS_AUTH = [
+        "confirmação", "confirmacao", "código de confirmação",
+        "codigo de confirmacao", "verificação", "verificacao",
+        "acesso", "autenticação", "codigo para", "uso único",
+        "canal pro", "grupo olx", "novo dispositivo",
+    ]
+    # Termos no corpo que confirmam ser um e-mail de autenticação
+    CORPO_AUTH = [
+        "confirmar", "uso único", "novo dispositivo",
+        "canal pro", "código", "codigo", "verificar",
+    ]
+    # Padrões de extração — específicos primeiro, genérico por último
+    PADROES = [
+        r"confirmar[:\s]+(\d{6})",
+        r"código[:\s]*(\d{6})",
+        r"codigo[:\s]*(\d{6})",
+        r"use o código[:\s]*(\d{6})",
+    ]
+
+    def _e_email_auth(from_h, subject_h, corpo):
+        from_l    = from_h.lower()
+        subject_l = subject_h.lower()
+        corpo_l   = corpo.lower()
+
+        # Rejeitar blacklist
+        if any(b in from_l for b in BLACKLIST_FROM):
+            return False, f"remetente bloqueado: {from_h[:60]}"
+
+        # Rejeitar assuntos promocionais óbvios
+        promo_keywords = ["chegou o imóvel", "perfeito pra você", "oferta", "promoção",
+                          "desconto", "novidade", "imóvel perfeito"]
+        if any(p in subject_l for p in promo_keywords):
+            return False, f"assunto promocional: {subject_h[:60]}"
+
+        # Exigir ao menos um termo de autenticação no assunto OU remetente confiável
+        assunto_ok = any(a in subject_l for a in ASSUNTOS_AUTH)
+        from_ok    = any(w in from_l for w in WHITELIST_FROM)
+        corpo_ok   = any(c in corpo_l for c in CORPO_AUTH)
+
+        if not (assunto_ok or from_ok) or not corpo_ok:
+            return False, f"não parece e-mail de autenticação (assunto={subject_h[:40]}, from={from_h[:40]})"
+
+        return True, "ok"
 
     try:
         minutos = max(2, janela_segundos // 60)
@@ -979,10 +1160,9 @@ def _gmail_buscar_codigo_2fa(service, janela_segundos=300):
             f'subject:"confirmacao" newer_than:{minutos}m',
             f'subject:"codigo" newer_than:{minutos}m',
             f'from:grupozap newer_than:{minutos}m',
-            f'from:zap newer_than:{minutos}m',
+            f'from:canalpro newer_than:{minutos}m',
         ]
 
-        # Coleta todas as mensagens candidatas das queries
         ids_vistos = set()
         mensagens_refs = []
         for query in queries:
@@ -997,7 +1177,8 @@ def _gmail_buscar_codigo_2fa(service, janela_segundos=300):
         if not mensagens_refs:
             return None
 
-        # Busca detalhes de todas para comparar datas
+        # Busca detalhes e filtra por timestamp_inicio
+        ts_corte = int(timestamp_inicio.timestamp() * 1000) if timestamp_inicio else 0
         msgs_com_data = []
         for msg_ref in mensagens_refs:
             try:
@@ -1005,33 +1186,54 @@ def _gmail_buscar_codigo_2fa(service, janela_segundos=300):
                     userId="me", id=msg_ref["id"], format="full"
                 ).execute()
                 internal_date = int(msg.get("internalDate", 0))
+                if internal_date < ts_corte:
+                    continue  # e-mail anterior ao login 2FA — ignorar
                 msgs_com_data.append((internal_date, msg))
             except Exception:
                 pass
 
         if not msgs_com_data:
+            print("   📭 Nenhum e-mail de autenticação encontrado após o início do 2FA.")
             return None
 
-        # Ordena da mais recente para a mais antiga e pega apenas a primeira
         msgs_com_data.sort(key=lambda x: x[0], reverse=True)
-        data_ts, msg_mais_recente = msgs_com_data[0]
 
-        data_email = datetime.fromtimestamp(data_ts / 1000).strftime("%H:%M:%S")
-        headers = {h["name"].lower(): h["value"]
-                   for h in msg_mais_recente.get("payload", {}).get("headers", [])}
-        print(f"   📧 E-mail mais recente: {data_email} | de='{headers.get('from','')[:50]}'"
-              f" | assunto='{headers.get('subject','')[:60]}'")
+        for data_ts, msg in msgs_com_data:
+            headers = {h["name"].lower(): h["value"]
+                       for h in msg.get("payload", {}).get("headers", [])}
+            from_h    = headers.get("from", "")
+            subject_h = headers.get("subject", "")
+            corpo     = _extrair_corpo_email(msg)
+            data_str  = datetime.fromtimestamp(data_ts / 1000).strftime("%H:%M:%S")
 
-        corpo = _extrair_corpo_email(msg_mais_recente)
-        print(f"   📄 Corpo (200 chars): {corpo[:200]}")
+            print(f"   📧 Candidato: {data_str} | de='{from_h[:50]}' | assunto='{subject_h[:50]}'")
 
-        for padrao in padroes:
-            m = re.search(padrao, corpo, re.IGNORECASE)
+            valido, motivo = _e_email_auth(from_h, subject_h, corpo)
+            if not valido:
+                print(f"   ❌ Rejeitado: {motivo}")
+                continue
+
+            print(f"   ✅ E-mail de autenticação aceito.")
+            print(f"   📄 Corpo (200 chars): {corpo[:200]}")
+
+            # Tenta padrões específicos primeiro
+            for padrao in PADROES:
+                m = re.search(padrao, corpo, re.IGNORECASE)
+                if m:
+                    codigo = m.group(1)
+                    print(f"✅ Código 2FA encontrado: {codigo}")
+                    return codigo
+
+            # Fallback: qualquer 6 dígitos — mas SOMENTE se e-mail passou na validação
+            m = re.search(r"\b(\d{6})\b", corpo)
             if m:
                 codigo = m.group(1)
-                print(f"✅ Código 2FA encontrado: {codigo}")
+                print(f"✅ Código 2FA encontrado (fallback): {codigo}")
                 return codigo
 
+            print("   ⚠️ E-mail passou na validação mas não contém código de 6 dígitos.")
+
+        print("❌ 2FA_CODE_NOT_FOUND_CONFIDENTLY — nenhum código confiável encontrado.")
         return None
 
     except Exception as exc:
@@ -1420,10 +1622,11 @@ def _canal_pro_preencher_codigo_2fa(codigo):
 def _canal_pro_handle_2fa():
     """
     Trata autenticação 2FA do Canal Pro via Gmail API OAuth2.
-    Busca automaticamente o código de 6 dígitos no e-mail enviado pelo Zap.
-    Na primeira execução abre o browser para autorização OAuth (único setup manual).
+    Registra o momento exato em que o 2FA foi disparado para filtrar
+    apenas e-mails chegados DEPOIS disso, evitando newsletters antigas.
     """
     print("🔐 Autenticação 2FA detectada — buscando código no Gmail...")
+    timestamp_inicio = datetime.now()  # marcos para filtrar e-mails anteriores
 
     print("📧 Autenticando Gmail API...")
     try:
@@ -1432,7 +1635,7 @@ def _canal_pro_handle_2fa():
     except Exception as exc:
         raise Exception(f"Falha ao autenticar Gmail API: {repr(exc)}")
 
-    TIMEOUT_SEGUNDOS  = 180
+    TIMEOUT_SEGUNDOS   = 180
     INTERVALO_SEGUNDOS = 10
     inicio = time.time()
     tentativa = 0
@@ -1443,7 +1646,11 @@ def _canal_pro_handle_2fa():
         print(f"   🔍 Tentativa #{tentativa} — buscando código 2FA... ({restante}s restantes)")
 
         janela = int(time.time() - inicio) + 30
-        codigo = _gmail_buscar_codigo_2fa(gmail_service, janela_segundos=max(janela, 60))
+        codigo = _gmail_buscar_codigo_2fa(
+            gmail_service,
+            janela_segundos=max(janela, 60),
+            timestamp_inicio=timestamp_inicio,
+        )
 
         if codigo and len(codigo) == 6 and codigo.isdigit():
             print(f"✅ Código 2FA obtido automaticamente: {codigo}")
@@ -1452,7 +1659,7 @@ def _canal_pro_handle_2fa():
 
         time.sleep(INTERVALO_SEGUNDOS)
 
-    raise Exception(f"Código 2FA não encontrado no Gmail após {TIMEOUT_SEGUNDOS}s")
+    raise Exception("ERROR_2FA: código não encontrado no Gmail após 180s")
 
 
 def _canal_pro_navigate_to_listings():
@@ -1817,6 +2024,65 @@ chrome.webRequest.onAuthRequired.addListener(
 
 
 # =============================================================================
+# ROLLBACK DE EMERGÊNCIA + RESUMO FINAL
+# =============================================================================
+
+def _tentar_rollback_se_necessario(imoveis_processados, ts_str):
+    """
+    Chamado nos blocos except do main().
+    Se algum imóvel foi desmarcado (checkpoint tem registros), tenta reverter.
+    Gera arquivo de pendência se o rollback parcial falhar.
+    """
+    # Prioriza lista em memória; fallback para checkpoint em disco
+    desmarcados = imoveis_processados or _checkpoint_carregar_desmarcados()
+    if not desmarcados:
+        return
+
+    print(f"\n⚠️  {len(desmarcados)} imóvel(is) foram desmarcados antes do erro.")
+    revertidos, pendentes = _rollback_automatico(desmarcados)
+
+    if pendentes:
+        arquivo = _gerar_arquivo_rollback_pendente(pendentes, ts_str)
+        print(f"\n🚨 ROLLBACK PARCIAL — {len(pendentes)} imóvel(is) NÃO revertidos!")
+        print(f"   Arquivo de pendência: {arquivo}")
+        print("   ⚠️  AÇÃO MANUAL NECESSÁRIA: remarcar VivaReal para os códigos abaixo:")
+        for item in pendentes:
+            print(f"      → {item['codigo']} | {item.get('categoria_nome','?')} ({item.get('categoria_vivareal','?')})")
+        _checkpoint_fechar("ERROR_AFTER_MUTATION_ROLLBACK_PENDING")
+    else:
+        print(f"✅ Rollback concluído: {len(revertidos)} imóvel(is) restaurados.")
+        _checkpoint_fechar("ERROR_AFTER_MUTATION_ROLLBACK_OK")
+
+
+def _imprimir_resumo(status, encontrados, restaurados, falhas, falhas_lista,
+                     arquivo_rollback, inicio):
+    """Imprime resumo estruturado no final — nunca oculta erros."""
+    duracao = str(datetime.now() - inicio).split(".")[0]
+    print("\n" + "=" * 60)
+    print("📊 RESUMO FINAL DA EXECUÇÃO")
+    print("=" * 60)
+    print(f"  status_final            : {status}")
+    print(f"  imóveis_encontrados     : {encontrados}")
+    print(f"  imóveis_restaurados     : {restaurados}")
+    print(f"  imóveis_falhas_parte2   : {falhas}")
+    print(f"  duração                 : {duracao}")
+    if arquivo_rollback:
+        print(f"  ⚠️  rollback_pendente   : {arquivo_rollback}")
+    if falhas_lista:
+        print("  Códigos com falha:")
+        for item in falhas_lista:
+            print(f"    → {item['codigo']} | {item.get('categoria_nome','?')}")
+    if status == "SUCCESS":
+        print("\n✅ Execução concluída com SUCESSO.")
+    elif status in ("SKIPPED_NO_ITEMS", "DRY_RUN"):
+        print(f"\nℹ️  Execução encerrada: {status} (nenhuma alteração feita).")
+    else:
+        print(f"\n❌ Execução encerrada com STATUS DE ERRO: {status}")
+        print("   Verifique os logs e o diretório 'state/' para detalhes.")
+    print("=" * 60)
+
+
+# =============================================================================
 # AGENDAMENTO
 # =============================================================================
 
@@ -1865,17 +2131,50 @@ def main():
 
     chrome_service = Service(ChromeDriverManager().install())
 
+    usando_headless = em_nuvem or MODO_HEADLESS
     if PROXY_ATIVO:
         print(f"🌐 Proxy ativo: {PROXY_HOST}:{PROXY_PORTA} (Brasil)")
-        options.add_argument(f"--proxy-server=http://{PROXY_HOST}:{PROXY_PORTA}")
-        ext_path = _criar_extensao_proxy_auth(PROXY_HOST, PROXY_PORTA, PROXY_USUARIO, PROXY_SENHA)
-        options.add_extension(ext_path)
+        if usando_headless:
+            # Extensões Chrome são incompatíveis com --headless em ambientes sem display.
+            # Em modo headless usamos apenas --proxy-server; o IP da VPS está autorizado
+            # no WebShare (sem auth), por isso a conexão é aceita.
+            options.add_argument(f"--proxy-server=http://{PROXY_HOST}:{PROXY_PORTA}")
+            print("   ℹ️ Headless: proxy sem extensão (IP autorizado no WebShare).")
+        else:
+            # Modo normal (PC local): extensão injeta credenciais para roteamento BR
+            options.add_argument(f"--proxy-server=http://{PROXY_HOST}:{PROXY_PORTA}")
+            ext_path = _criar_extensao_proxy_auth(PROXY_HOST, PROXY_PORTA, PROXY_USUARIO, PROXY_SENHA)
+            options.add_extension(ext_path)
 
-    driver = webdriver.Chrome(service=chrome_service, options=options)
+    # Logging do startup do navegador
+    print(f"🖥️  Iniciando Chrome (headless={usando_headless}, proxy={PROXY_ATIVO})...")
+    try:
+        driver = webdriver.Chrome(service=chrome_service, options=options)
+        v = driver.capabilities.get("browserVersion", "?")
+        cdv = driver.capabilities.get("chrome", {}).get("chromedriverVersion", "?")
+        print(f"   Chrome {v} | ChromeDriver {str(cdv)[:30]} | OK")
+    except WebDriverException as exc:
+        print(f"⛔ ERROR_BROWSER_STARTUP: {type(exc).__name__} | {repr(exc)[:300]}")
+        raise
     wait = WebDriverWait(driver, 30)
     actions = ActionChains(driver)
 
+    ts_str            = datetime.now().strftime("%Y%m%d_%H%M")
+    inicio_execucao   = datetime.now()
+    status_final      = "ERROR_UNKNOWN"
+    imoveis_processados = []
+    restaurados_parte2  = []
+    falhas_parte2       = []
+    arquivo_rollback    = None
+
+    if DRY_RUN:
+        print("🔍 DRY_RUN ATIVO — nenhuma alteração será feita no CRM.")
+
     try:
+        # ── PRÉ-EXECUÇÃO: valida diretório de logs/checkpoints ────────────────
+        os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+        os.makedirs("logs", exist_ok=True)
+
         # --- LOGIN CRM ---
         driver.get(CRM_URL)
         wait.until(EC.visibility_of_element_located((By.NAME, "usuario"))).send_keys(USUARIO)
@@ -1907,9 +2206,36 @@ def main():
             # FLUXO NORMAL: executa Parte 1
             # =====================================================================
             if not go_to_imoveis_page_fresh():
+                status_final = "ERROR_BEFORE_MUTATION"
                 raise Exception("Não foi possível abrir Imóveis para iniciar a Parte 1.")
 
             apply_initial_filters()
+
+            # ── GUARDA DE 0 IMÓVEIS ──────────────────────────────────────────
+            # Conta os botões de edição ANTES de processar para validar o filtro
+            botoes_pre = driver.find_elements(By.XPATH, "//button[contains(@onclick,'mdImovelUpdate')]")
+            if len(botoes_pre) == 0:
+                # Tenta recarregar os filtros uma vez antes de desistir
+                print("⚠️ Nenhum imóvel encontrado na 1ª tentativa. Refazendo filtros...")
+                time.sleep(3)
+                apply_initial_filters()
+                botoes_pre = driver.find_elements(By.XPATH, "//button[contains(@onclick,'mdImovelUpdate')]")
+
+            if len(botoes_pre) == 0:
+                status_final = "SKIPPED_NO_ITEMS"
+                print("\n⚠️ Nenhum imóvel elegível encontrado após 2 tentativas.")
+                print("   Nenhuma alteração será feita. Encerrando como SKIPPED_NO_ITEMS.")
+                _imprimir_resumo(status_final, 0, 0, 0, [], None, inicio_execucao)
+                return  # sai do try normalmente, sem rollback
+
+            if DRY_RUN:
+                print(f"\n🔍 DRY_RUN: {len(botoes_pre)} imóvel(is) seriam processados. Nada alterado.")
+                status_final = "DRY_RUN"
+                _imprimir_resumo(status_final, len(botoes_pre), 0, 0, [], None, inicio_execucao)
+                return
+
+            # ── CRIA CHECKPOINT ANTES DE QUALQUER ALTERAÇÃO ──────────────────
+            _checkpoint_criar(ts_str)
 
             print("\n🚧 ===== PARTE 1: desmarcando VivaReal =====")
             imoveis_processados = process_part_1_collect_and_disable_vivareal()
@@ -1926,14 +2252,13 @@ def main():
             go_to_integracoes_parceiros_and_update_vivareal()
 
         # =====================================================================
-        # PARTE INTERMEDIÁRIA: verifica no Canal Pro se os imóveis foram
-        #                      removidos do ZAP Imóveis
+        # PARTE INTERMEDIÁRIA
         # =====================================================================
         print("\n🔍 ===== PARTE INTERMEDIÁRIA: verificando remoção no ZAP Imóveis =====")
         verify_properties_removed_from_zap(imoveis_processados)
 
         # =====================================================================
-        # PARTE 2: reabre por código, remarca VivaReal e restaura categoria
+        # PARTE 2: remarcar VivaReal
         # =====================================================================
         print("\n🚧 ===== PARTE 2: restaurando VivaReal =====")
         restaurados_parte2, falhas_parte2 = process_part_2_restore_vivareal(imoveis_processados)
@@ -1941,25 +2266,46 @@ def main():
         print("🚀 Atualizando VivaReal após Parte 2...")
         go_to_integracoes_parceiros_and_update_vivareal()
 
-        print("\n📊 RESUMO FINAL")
-        print(f"Parte 1 - imóveis desmarcados: {len(imoveis_processados)}")
-        print(f"Parte 2 - imóveis restaurados: {len(restaurados_parte2)}")
-        print(f"Parte 2 - falhas: {len(falhas_parte2)}")
         if falhas_parte2:
-            print("⛔ Códigos com falha na Parte 2:")
-            for item in falhas_parte2:
-                print(f"- {item['codigo']} | {item['categoria_nome']} ({item['categoria_vivareal']})")
+            arquivo_rollback = _gerar_arquivo_rollback_pendente(falhas_parte2, ts_str)
+            status_final = "ERROR_AFTER_MUTATION_ROLLBACK_PENDING"
+        else:
+            status_final = "SUCCESS"
+            _checkpoint_fechar("SUCCESS")
+
+    except (InvalidSessionIdException, WebDriverException) as exc:
+        cod = "ERROR_BROWSER_STARTUP" if "ERROR_BROWSER_STARTUP" in repr(exc) else "ERROR_BROWSER"
+        print(f"\n⛔ {cod}: {type(exc).__name__} | {repr(exc)[:200]}")
+        status_final = cod
+        _tentar_rollback_se_necessario(imoveis_processados, ts_str)
 
     except TimeoutError as exc:
         print(f"\n⛔ {exc}")
-    except InvalidSessionIdException:
-        print("\n⛔ Sessão do Chrome foi perdida durante a execução.")
-    except WebDriverException as exc:
-        print(f"\n⛔ Erro do navegador/driver: {type(exc).__name__} | {repr(exc)}")
+        status_final = "ERROR_TIMEOUT"
+        _tentar_rollback_se_necessario(imoveis_processados, ts_str)
+
     except Exception as exc:
-        print(f"\n⛔ Erro geral: {type(exc).__name__} | {repr(exc)}")
+        msg = str(exc)
+        if "ERROR_2FA" in msg:
+            status_final = "ERROR_2FA"
+        elif "ERROR_BROWSER_STARTUP" in msg:
+            status_final = "ERROR_BROWSER_STARTUP"
+        elif status_final == "ERROR_UNKNOWN":
+            status_final = "ERROR_GENERAL"
+        print(f"\n⛔ {status_final}: {type(exc).__name__} | {msg[:300]}")
+        _tentar_rollback_se_necessario(imoveis_processados, ts_str)
+
     finally:
-        print("\n✅ Processo concluído.")
+        _checkpoint_fechar(status_final)
+        _imprimir_resumo(
+            status_final,
+            len(imoveis_processados),
+            len(restaurados_parte2),
+            len(falhas_parte2),
+            falhas_parte2,
+            arquivo_rollback,
+            inicio_execucao,
+        )
         if driver and (em_nuvem or os.getenv("FECHAR_BROWSER", "") == "1"):
             driver.quit()
 
