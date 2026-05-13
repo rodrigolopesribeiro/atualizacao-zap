@@ -908,10 +908,6 @@ def _rollback_automatico(imoveis_para_reverter):
         if not codigo:
             continue
         try:
-            from atualizacao_zap import _process_single_item_parte2  # self-import seguro
-        except Exception:
-            pass
-        try:
             ok = _process_single_item_parte2(item)
             if ok:
                 revertidos.append(item)
@@ -1627,7 +1623,9 @@ def _canal_pro_handle_2fa():
     apenas e-mails chegados DEPOIS disso, evitando newsletters antigas.
     """
     print("🔐 Autenticação 2FA detectada — buscando código no Gmail...")
-    timestamp_inicio = datetime.now()  # marcos para filtrar e-mails anteriores
+    # Subtrai 3 minutos: o email é enviado quando "Entrar" é clicado,
+    # antes da tela de 2FA aparecer. O buffer evita rejeitar o código válido.
+    timestamp_inicio = datetime.now() - timedelta(minutes=3)
 
     print("📧 Autenticando Gmail API...")
     try:
@@ -1824,67 +1822,77 @@ def verify_properties_removed_from_zap(imoveis_processados):
     print(f"   Intervalo entre verificações: {VERIFICACAO_INTERVALO_SEGUNDOS // 60} minuto(s)\n")
 
     aba_crm = _canal_pro_login()
-    _canal_pro_navigate_to_listings()
+    try:
+        _canal_pro_navigate_to_listings()
+    except Exception:
+        pass
 
     inicio = time.time()
     tentativa = 1
 
-    while True:
-        # Verifica timeout
-        if time.time() - inicio > VERIFICACAO_TIMEOUT_SEGUNDOS:
-            print(f"⛔ TIMEOUT: imóveis não foram removidos do ZAP em "
-                  f"{VERIFICACAO_TIMEOUT_SEGUNDOS // 3600} hora(s). Encerrando.")
-            driver.close()
-            driver.switch_to.window(aba_crm)
-            raise TimeoutError(f"Timeout de {VERIFICACAO_TIMEOUT_SEGUNDOS // 3600}h na verificação do Canal Pro.")
+    try:
+        while True:
+            # Verifica timeout
+            if time.time() - inicio > VERIFICACAO_TIMEOUT_SEGUNDOS:
+                print(f"⛔ TIMEOUT: imóveis não foram removidos do ZAP em "
+                      f"{VERIFICACAO_TIMEOUT_SEGUNDOS // 3600} hora(s). Encerrando.")
+                raise TimeoutError(f"Timeout de {VERIFICACAO_TIMEOUT_SEGUNDOS // 3600}h na verificação do Canal Pro.")
 
-        horario = datetime.now().strftime("%H:%M:%S")
-        print(f"🔍 [{horario}] Verificação #{tentativa} — varrendo anúncios no Canal Pro...")
+            horario = datetime.now().strftime("%H:%M:%S")
+            print(f"🔍 [{horario}] Verificação #{tentativa} — varrendo anúncios no Canal Pro...")
 
-        try:
-            ativos = _canal_pro_collect_all_active_codes()
-        except Exception as exc:
-            print(f"⚠️ Erro ao coletar códigos: {type(exc).__name__} | {repr(exc)}")
-            ativos = None
+            try:
+                ativos = _canal_pro_collect_all_active_codes()
+            except Exception as exc:
+                print(f"⚠️ Erro ao coletar códigos: {type(exc).__name__} | {repr(exc)}")
+                ativos = None
 
-        if ativos is None:
-            print(f"   ⚠️ Resultado inválido — aguardando {VERIFICACAO_INTERVALO_SEGUNDOS // 60} min antes de tentar novamente.")
+            if ativos is None:
+                print(f"   ⚠️ Resultado inválido — aguardando {VERIFICACAO_INTERVALO_SEGUNDOS // 60} min antes de tentar novamente.")
+                time.sleep(VERIFICACAO_INTERVALO_SEGUNDOS)
+                tentativa += 1
+                _canal_pro_navigate_to_listings()
+                continue
+
+            print(f"   📊 Total de códigos ativos no Canal Pro: {len(ativos)}")
+
+            ainda_ativos = codigos_alvo & ativos
+            ja_removidos = codigos_alvo - ativos
+
+            if ja_removidos:
+                print(f"   ✅ Já removidos do ZAP: {sorted(ja_removidos)}")
+
+            if not ainda_ativos:
+                print("✅ TODOS os imóveis confirmados como removidos do ZAP Imóveis!")
+                print("🔒 Fechando aba do Canal Pro e retornando ao CRM...\n")
+                return
+
+            proxima = datetime.now().strftime("%H:%M:%S")
+            print(f"   ⏳ Ainda ativos no ZAP ({len(ainda_ativos)} imóvel(is)): {sorted(ainda_ativos)}")
+            print(f"   ⏱️ Próxima verificação em {VERIFICACAO_INTERVALO_SEGUNDOS // 60} minuto(s)... [{proxima}]")
             time.sleep(VERIFICACAO_INTERVALO_SEGUNDOS)
             tentativa += 1
-            _canal_pro_navigate_to_listings()
-            continue
 
-        print(f"   📊 Total de códigos ativos no Canal Pro: {len(ativos)}")
-
-        ainda_ativos = codigos_alvo & ativos
-        ja_removidos = codigos_alvo - ativos
-
-        if ja_removidos:
-            print(f"   ✅ Já removidos do ZAP: {sorted(ja_removidos)}")
-
-        if not ainda_ativos:
-            print("✅ TODOS os imóveis confirmados como removidos do ZAP Imóveis!")
-            print("🔒 Fechando aba do Canal Pro e retornando ao CRM...\n")
-            driver.close()
-            driver.switch_to.window(aba_crm)
-            return
-
-        proxima = datetime.now().strftime("%H:%M:%S")
-        print(f"   ⏳ Ainda ativos no ZAP ({len(ainda_ativos)} imóvel(is)): {sorted(ainda_ativos)}")
-        print(f"   ⏱️ Próxima verificação em {VERIFICACAO_INTERVALO_SEGUNDOS // 60} minuto(s)... [{proxima}]")
-        time.sleep(VERIFICACAO_INTERVALO_SEGUNDOS)
-        tentativa += 1
-
-        # Renavega para listings (sem novo login)
-        try:
-            _canal_pro_navigate_to_listings()
-        except Exception as exc:
-            print(f"⚠️ Falha ao renavegar — tentando login novamente: {type(exc).__name__}")
+            # Renavega para listings (sem novo login)
             try:
-                aba_crm = _canal_pro_login()
                 _canal_pro_navigate_to_listings()
-            except Exception:
-                pass
+            except Exception as exc:
+                print(f"⚠️ Falha ao renavegar — tentando login novamente: {type(exc).__name__}")
+                try:
+                    aba_crm = _canal_pro_login()
+                    _canal_pro_navigate_to_listings()
+                except Exception:
+                    pass
+
+    finally:
+        # Garante que a aba do Canal Pro seja fechada e o driver volte ao CRM
+        # independentemente de sucesso ou exceção (2FA, timeout, etc.)
+        try:
+            if len(driver.window_handles) > 1:
+                driver.close()
+                driver.switch_to.window(aba_crm)
+        except Exception:
+            pass
 
 
 
