@@ -217,6 +217,7 @@ def go_to_home_screen():
 
 def go_to_imoveis_page_fresh():
     go_to_home_screen()
+    close_any_open_modal()
 
     try:
         imoveis = wait.until(
