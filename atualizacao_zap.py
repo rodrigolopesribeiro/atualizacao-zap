@@ -62,7 +62,7 @@ CATEGORIAS_VIVAREAL = {
 
 # ⚠️ APENAS PARA TESTE — voltar para False em execuções normais de produção
 # Quando True: pula a Parte 1, lê imoveis_parte1.json e começa na Parte Intermediária
-MODO_PULAR_PARTE_1 = False
+MODO_PULAR_PARTE_1 = True
 MODO_HEADLESS = os.getenv("MODO_HEADLESS", "false").lower() == "true"
 DRY_RUN       = os.getenv("DRY_RUN",  "false").lower() == "true"
 SAFE_MODE     = os.getenv("SAFE_MODE", "false").lower() == "true"
@@ -2060,6 +2060,11 @@ def _tentar_rollback_se_necessario(imoveis_processados, ts_str):
         _checkpoint_fechar("ERROR_AFTER_MUTATION_ROLLBACK_PENDING")
     else:
         print(f"✅ Rollback concluído: {len(revertidos)} imóvel(is) restaurados.")
+        try:
+            print("🚀 Disparando sincronização do ZAP após rollback...")
+            go_to_integracoes_parceiros_and_update_vivareal()
+        except Exception as exc:
+            print(f"⚠️ Sync ZAP pós-rollback falhou: {exc}")
         _checkpoint_fechar("ERROR_AFTER_MUTATION_ROLLBACK_OK")
 
 
