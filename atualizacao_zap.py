@@ -62,7 +62,7 @@ CATEGORIAS_VIVAREAL = {
 
 # ⚠️ APENAS PARA TESTE — voltar para False em execuções normais de produção
 # Quando True: pula a Parte 1, lê imoveis_parte1.json e começa na Parte Intermediária
-MODO_PULAR_PARTE_1 = True
+MODO_PULAR_PARTE_1 = False
 MODO_HEADLESS = os.getenv("MODO_HEADLESS", "false").lower() == "true"
 DRY_RUN       = os.getenv("DRY_RUN",  "false").lower() == "true"
 SAFE_MODE     = os.getenv("SAFE_MODE", "false").lower() == "true"
