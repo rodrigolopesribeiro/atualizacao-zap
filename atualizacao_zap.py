@@ -943,7 +943,8 @@ def _gerar_arquivo_rollback_pendente(pendentes, timestamp_str):
 
 def process_part_1_collect_and_disable_vivareal():
     imoveis_processados = []
-    codigos_ja_salvos = set()
+    codigos_ja_processados = set()
+    MAX_TENTATIVAS_PARTE_1 = 50
 
     pagina = 1
     while True:
@@ -952,13 +953,19 @@ def process_part_1_collect_and_disable_vivareal():
         except TimeoutException:
             print(f"✅ Página {pagina} sem imóveis para processar.")
 
+        tentativas_pagina = 0
         while True:
+            tentativas_pagina += 1
+            if tentativas_pagina > MAX_TENTATIVAS_PARTE_1:
+                print(f"⛔ Limite de {MAX_TENTATIVAS_PARTE_1} tentativas atingido na página {pagina}. Encerrando.")
+                break
+
             buttons = driver.find_elements(By.XPATH, "//button[contains(@onclick,'mdImovelUpdate')]")
             if not buttons:
                 print("✅ Nenhum imóvel restante na lista filtrada desta página.")
                 break
 
-            print(f"📌 Imóveis restantes na lista filtrada: {len(buttons)}")
+            print(f"📌 Imóveis restantes na lista filtrada: {len(buttons)} | 🔢 Tentativa {tentativas_pagina}/{MAX_TENTATIVAS_PARTE_1}")
 
             if not is_session_alive():
                 raise InvalidSessionIdException("Sessão do navegador foi encerrada.")
@@ -967,6 +974,19 @@ def process_part_1_collect_and_disable_vivareal():
                 safe_click(buttons[0])
                 wait.until(EC.visibility_of_element_located((By.ID, "titulo-input")))
 
+                # Captura código PRIMEIRO para verificar duplicata antes de processar
+                codigo = get_property_code_from_modal()
+                if not codigo:
+                    raise Exception("Código do imóvel vazio")
+
+                if codigo in codigos_ja_processados:
+                    print(f"⚠️ Código {codigo} já processado nesta execução. Fechando modal e pulando.")
+                    print(f"📊 Códigos já processados: {sorted(codigos_ja_processados)}")
+                    close_any_open_modal()
+                    close_known_popup_modals()
+                    time.sleep(2)
+                    continue
+
                 update_description_text()
                 swap_7th_with_8th_photo()
 
@@ -974,31 +994,42 @@ def process_part_1_collect_and_disable_vivareal():
                     raise Exception("Não abriu Divulgação")
 
                 categoria_value, categoria_nome = get_vivareal_category_value()
+
+                # Skip se VivaReal já está desmarcado — não reprocessar
+                if not is_vivareal_checked():
+                    print(f"ℹ️ Imóvel {codigo} já está desmarcado no VivaReal. Pulando sem salvar.")
+                    codigos_ja_processados.add(codigo)
+                    close_any_open_modal()
+                    close_known_popup_modals()
+                    time.sleep(1.5)
+                    continue
+
                 set_vivareal_checked(False)
 
-                codigo = get_property_code_from_modal()
-                if not codigo:
-                    raise Exception("Código do imóvel vazio")
-
-                if codigo not in codigos_ja_salvos:
-                    imoveis_processados.append(
-                        {
-                            "codigo": codigo,
-                            "categoria_vivareal": categoria_value,
-                            "categoria_nome": categoria_nome,
-                        }
-                    )
-                    codigos_ja_salvos.add(codigo)
+                if codigo not in {i["codigo"] for i in imoveis_processados}:
+                    imoveis_processados.append({
+                        "codigo": codigo,
+                        "categoria_vivareal": categoria_value,
+                        "categoria_nome": categoria_nome,
+                    })
 
                 save_property()
                 _checkpoint_registrar_desmarcado(codigo, categoria_value, categoria_nome)
                 print("💾 Imóvel salvo na Parte 1.")
+
+                # Fechar modal OLX que aparece após salvar
                 time.sleep(1)
+                close_known_popup_modals()
+                close_any_open_modal()
+                time.sleep(1.5)
+
+                codigos_ja_processados.add(codigo)
 
             except Exception as exc:
                 print(f"⚠️ Erro na Parte 1: {type(exc).__name__} | {repr(exc)}")
                 debug_modal_state("erro_parte1")
                 close_any_open_modal()
+                close_known_popup_modals()
                 time.sleep(1)
 
                 if isinstance(exc, (InvalidSessionIdException, WebDriverException)) and not is_session_alive():
