@@ -2193,14 +2193,19 @@ def main():
 
     # Logging do startup do navegador
     print(f"🖥️  Iniciando Chrome (headless={usando_headless}, proxy={PROXY_ATIVO})...")
-    try:
-        driver = webdriver.Chrome(service=chrome_service, options=options)
-        v = driver.capabilities.get("browserVersion", "?")
-        cdv = driver.capabilities.get("chrome", {}).get("chromedriverVersion", "?")
-        print(f"   Chrome {v} | ChromeDriver {str(cdv)[:30]} | OK")
-    except WebDriverException as exc:
-        print(f"⛔ ERROR_BROWSER_STARTUP: {type(exc).__name__} | {repr(exc)[:300]}")
-        raise
+    for tentativa_browser in range(1, 4):
+        try:
+            driver = webdriver.Chrome(service=chrome_service, options=options)
+            v = driver.capabilities.get("browserVersion", "?")
+            cdv = driver.capabilities.get("chrome", {}).get("chromedriverVersion", "?")
+            print(f"   Chrome {v} | ChromeDriver {str(cdv)[:30]} | OK")
+            break
+        except WebDriverException as exc:
+            print(f"⚠️ Tentativa {tentativa_browser}/3 falhou ao iniciar Chrome: {repr(exc)[:200]}")
+            if tentativa_browser == 3:
+                print("⛔ ERROR_BROWSER_STARTUP: Chrome não iniciou após 3 tentativas.")
+                raise
+            time.sleep(5)
     wait = WebDriverWait(driver, 30)
     actions = ActionChains(driver)
 
