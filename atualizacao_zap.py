@@ -2,6 +2,9 @@ import base64
 import json
 import os
 import re
+import shutil
+import subprocess
+import traceback
 from datetime import datetime, timedelta
 import time
 
@@ -40,7 +43,11 @@ CANALPRO_EMAIL = os.environ["CANALPRO_EMAIL"]
 CANALPRO_SENHA = os.environ["CANALPRO_SENHA"]
 GMAIL_CREDENTIALS_FILE = "gmail_credentials.json"
 GMAIL_TOKEN_FILE       = "gmail_token.json"
-GMAIL_SCOPES           = ["https://www.googleapis.com/auth/gmail.readonly"]
+GMAIL_SCOPES           = [
+    "https://www.googleapis.com/auth/gmail.readonly",
+    "https://www.googleapis.com/auth/gmail.send",
+]
+GMAIL_DESTINATARIO     = "mkmarcoslopes@gmail.com"
 CANAL_PRO_URL_LOGIN    = "https://canalpro.grupozap.com/login"
 CANAL_PRO_URL_LISTINGS = "https://canalpro.grupozap.com/ZAP_OLX/0/listings"
 VERIFICACAO_INTERVALO_SEGUNDOS = 1800  # 30 minutos entre verificações
@@ -2145,6 +2152,149 @@ def wait_until_10am():
 
 
 # =============================================================================
+# HEALTHCHECK / CHROME STARTUP / NOTIFICAÇÃO
+# =============================================================================
+
+def _healthcheck_inicial():
+    problemas = []
+
+    for arq in ["gmail_credentials.json", "gmail_token.json"]:
+        if not os.path.exists(arq):
+            problemas.append(f"Arquivo ausente: {arq}")
+
+    try:
+        _, _, free = shutil.disk_usage("/")
+        if free < 500 * 1024 * 1024:
+            problemas.append(f"Pouco espaço em disco: {free // 1024 // 1024}MB livres")
+    except Exception:
+        pass
+
+    for path in ["/tmp", "/dev/shm"]:
+        if os.path.exists(path):
+            try:
+                _, _, free_p = shutil.disk_usage(path)
+                if free_p < 100 * 1024 * 1024:
+                    problemas.append(f"Pouco espaço em {path}: {free_p // 1024 // 1024}MB")
+            except Exception:
+                pass
+
+    if os.name != "nt":
+        try:
+            r = subprocess.run(["google-chrome", "--version"],
+                               capture_output=True, text=True, timeout=5)
+            print(f"   Chrome: {r.stdout.strip()}")
+        except Exception as exc:
+            problemas.append(f"google-chrome não encontrado: {exc}")
+
+    if problemas:
+        print("⚠️ HEALTHCHECK encontrou problemas:")
+        for p in problemas:
+            print(f"   - {p}")
+        return False
+
+    print("✅ Healthcheck OK — todos os pré-requisitos atendidos.")
+    return True
+
+
+def _iniciar_chrome_com_retry(options, usando_headless):
+    MAX_TENTATIVAS = 5
+    BACKOFF = [5, 10, 20, 40]
+
+    ultimo_erro = None
+
+    for tentativa in range(1, MAX_TENTATIVAS + 1):
+        print(f"🖥️  Tentativa {tentativa}/{MAX_TENTATIVAS} — iniciando Chrome...")
+        print(f"   Argumentos: {options.arguments}")
+        try:
+            service = Service(ChromeDriverManager().install())
+            d = webdriver.Chrome(service=service, options=options)
+            d.set_page_load_timeout(30)
+            _ = d.current_url
+            v   = d.capabilities.get("browserVersion", "?")
+            cdv = d.capabilities.get("chrome", {}).get("chromedriverVersion", "?")
+            print(f"✅ Chrome iniciado na tentativa {tentativa}. "
+                  f"Chrome {v} | ChromeDriver {str(cdv)[:30]}")
+            return d
+        except Exception as exc:
+            ultimo_erro = exc
+            print(f"⚠️ Tentativa {tentativa}/{MAX_TENTATIVAS} falhou:")
+            print(f"   Tipo: {type(exc).__name__}")
+            print(f"   Mensagem: {str(exc)[:500]}")
+            print(traceback.format_exc()[:800])
+
+            if os.name != "nt":
+                try:
+                    subprocess.run(["pkill", "-9", "-f", "chrome"],
+                                   timeout=5, check=False, capture_output=True)
+                    subprocess.run(["pkill", "-9", "-f", "chromedriver"],
+                                   timeout=5, check=False, capture_output=True)
+                    for f in ["/tmp/SingletonLock", "/tmp/SingletonCookie",
+                               "/tmp/SingletonSocket"]:
+                        try:
+                            os.remove(f)
+                        except OSError:
+                            pass
+                except Exception:
+                    pass
+
+            if tentativa < MAX_TENTATIVAS:
+                espera = BACKOFF[tentativa - 1]
+                print(f"   ⏳ Aguardando {espera}s antes da próxima tentativa...")
+                time.sleep(espera)
+
+    # Fallback final: sem proxy
+    if usando_headless and any("--proxy-server" in a for a in options.arguments):
+        print("⚠️ Tentando última vez SEM proxy como fallback de emergência...")
+        try:
+            opts_fb = Options()
+            for arg in options.arguments:
+                if "--proxy-server" not in arg:
+                    opts_fb.add_argument(arg)
+            service = Service(ChromeDriverManager().install())
+            d = webdriver.Chrome(service=service, options=opts_fb)
+            d.set_page_load_timeout(30)
+            _ = d.current_url
+            print("✅ Chrome iniciado SEM proxy (fallback de emergência).")
+            return d
+        except Exception as exc_fb:
+            print(f"⛔ Fallback sem proxy também falhou: {exc_fb}")
+
+    raise Exception(
+        f"ERROR_BROWSER_STARTUP: Chrome não iniciou após {MAX_TENTATIVAS} tentativas. "
+        f"Último erro: {type(ultimo_erro).__name__}: {ultimo_erro}"
+    )
+
+
+def _enviar_notificacao_final(status, inicio_execucao, encontrados, restaurados):
+    try:
+        from email.mime.text import MIMEText
+        gmail_service = _gmail_autenticar()
+        data    = datetime.now().strftime("%d/%m/%Y %H:%M")
+        duracao = str(datetime.now() - inicio_execucao).split(".")[0]
+        icone   = "✅" if status == "SUCCESS" else "❌"
+        assunto = (f"{icone} Atualização ZAP — SUCESSO ({datetime.now().strftime('%d/%m/%Y')})"
+                   if status == "SUCCESS"
+                   else f"{icone} Atualização ZAP — FALHA: {status} ({datetime.now().strftime('%d/%m/%Y')})")
+        corpo = (
+            f"Execução do dia {data}\n\n"
+            f"Status: {status}\n"
+            f"Duração: {duracao}\n"
+            f"Imóveis encontrados: {encontrados}\n"
+            f"Imóveis restaurados: {restaurados}\n\n"
+            f"Logs completos na VPS:\n"
+            f"/opt/atualizacao-zap/logs/\n"
+        )
+        msg = MIMEText(corpo)
+        msg["to"]      = GMAIL_DESTINATARIO
+        msg["subject"] = assunto
+        raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
+        gmail_service.users().messages().send(userId="me", body={"raw": raw}).execute()
+        print("📧 Notificação enviada por e-mail.")
+    except Exception as exc:
+        print(f"⚠️ Falha ao enviar notificação: {exc}")
+
+
+# =============================================================================
 # MAIN
 # =============================================================================
 
@@ -2160,54 +2310,54 @@ def main():
     elif teste_local:
         print("🧪 MODO TESTE: pulando espera das 23h.")
 
+    print("🔍 Verificando pré-requisitos...")
+    if not _healthcheck_inicial():
+        raise Exception("Healthcheck falhou — abortando antes de iniciar.")
+
     options = Options()
     options.add_argument("--disable-notifications")
     options.add_argument("--disable-popup-blocking")
     options.add_argument("--disable-gpu")
 
-    if em_nuvem or MODO_HEADLESS:
-        # Modo headless para rodar em servidor Linux sem interface gráfica
+    usando_headless = em_nuvem or MODO_HEADLESS
+
+    if usando_headless:
         options.add_argument("--headless=new")
         options.add_argument("--no-sandbox")
         options.add_argument("--disable-dev-shm-usage")
         options.add_argument("--window-size=1920,1080")
+        # Flags extras de estabilidade em servidor
+        options.add_argument("--disable-software-rasterizer")
+        options.add_argument("--disable-extensions")
+        options.add_argument("--disable-background-networking")
+        options.add_argument("--disable-default-apps")
+        options.add_argument("--disable-sync")
+        options.add_argument("--disable-translate")
+        options.add_argument("--metrics-recording-only")
+        options.add_argument("--mute-audio")
+        options.add_argument("--no-first-run")
+        options.add_argument("--safebrowsing-disable-auto-update")
+        options.add_argument("--disable-features=VizDisplayCompositor,TranslateUI")
+        options.add_argument("--disable-backgrounding-occluded-windows")
+        options.add_argument("--disable-renderer-backgrounding")
+        options.add_argument("--disable-ipc-flooding-protection")
     else:
         options.add_argument("--start-maximized")
 
-    chrome_service = Service(ChromeDriverManager().install())
+    # Diretório temporário isolado por execução (evita conflito de lock files)
+    temp_chrome_dir = tempfile.mkdtemp(prefix="chrome_session_")
+    options.add_argument(f"--user-data-dir={temp_chrome_dir}")
+    options.add_argument(f"--disk-cache-dir={temp_chrome_dir}/cache")
 
-    usando_headless = em_nuvem or MODO_HEADLESS
     if PROXY_ATIVO:
         print(f"🌐 Proxy ativo: {PROXY_HOST}:{PROXY_PORTA} (Brasil)")
         if usando_headless:
-            # Extensões Chrome são incompatíveis com --headless em ambientes sem display.
-            # Em modo headless usamos apenas --proxy-server; o IP da VPS está autorizado
-            # no WebShare (sem auth), por isso a conexão é aceita.
             options.add_argument(f"--proxy-server=http://{PROXY_HOST}:{PROXY_PORTA}")
             print("   ℹ️ Headless: proxy sem extensão (IP autorizado no WebShare).")
         else:
-            # Modo normal (PC local): extensão injeta credenciais para roteamento BR
             options.add_argument(f"--proxy-server=http://{PROXY_HOST}:{PROXY_PORTA}")
             ext_path = _criar_extensao_proxy_auth(PROXY_HOST, PROXY_PORTA, PROXY_USUARIO, PROXY_SENHA)
             options.add_extension(ext_path)
-
-    # Logging do startup do navegador
-    print(f"🖥️  Iniciando Chrome (headless={usando_headless}, proxy={PROXY_ATIVO})...")
-    for tentativa_browser in range(1, 4):
-        try:
-            driver = webdriver.Chrome(service=chrome_service, options=options)
-            v = driver.capabilities.get("browserVersion", "?")
-            cdv = driver.capabilities.get("chrome", {}).get("chromedriverVersion", "?")
-            print(f"   Chrome {v} | ChromeDriver {str(cdv)[:30]} | OK")
-            break
-        except WebDriverException as exc:
-            print(f"⚠️ Tentativa {tentativa_browser}/3 falhou ao iniciar Chrome: {repr(exc)[:200]}")
-            if tentativa_browser == 3:
-                print("⛔ ERROR_BROWSER_STARTUP: Chrome não iniciou após 3 tentativas.")
-                raise
-            time.sleep(5)
-    wait = WebDriverWait(driver, 30)
-    actions = ActionChains(driver)
 
     ts_str            = datetime.now().strftime("%Y%m%d_%H%M")
     inicio_execucao   = datetime.now()
@@ -2216,6 +2366,10 @@ def main():
     restaurados_parte2  = []
     falhas_parte2       = []
     arquivo_rollback    = None
+
+    driver = _iniciar_chrome_com_retry(options, usando_headless)
+    wait = WebDriverWait(driver, 30)
+    actions = ActionChains(driver)
 
     if DRY_RUN:
         print("🔍 DRY_RUN ATIVO — nenhuma alteração será feita no CRM.")
@@ -2356,8 +2510,19 @@ def main():
             arquivo_rollback,
             inicio_execucao,
         )
+        _enviar_notificacao_final(
+            status_final, inicio_execucao,
+            len(imoveis_processados), len(restaurados_parte2)
+        )
         if driver and (em_nuvem or os.getenv("FECHAR_BROWSER", "") == "1"):
-            driver.quit()
+            try:
+                driver.quit()
+            except Exception:
+                pass
+        try:
+            shutil.rmtree(temp_chrome_dir, ignore_errors=True)
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
