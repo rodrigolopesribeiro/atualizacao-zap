@@ -70,6 +70,7 @@ CATEGORIAS_VIVAREAL = {
 # ⚠️ APENAS PARA TESTE — voltar para False em execuções normais de produção
 # Quando True: pula a Parte 1, lê imoveis_parte1.json e começa na Parte Intermediária
 MODO_PULAR_PARTE_1 = False
+EXPECTATIVA_MINIMA_PARTE_1 = 5  # alerta se Parte 1 processar menos que isso
 MODO_HEADLESS = os.getenv("MODO_HEADLESS", "false").lower() == "true"
 DRY_RUN       = os.getenv("DRY_RUN",  "false").lower() == "true"
 SAFE_MODE     = os.getenv("SAFE_MODE", "false").lower() == "true"
@@ -130,11 +131,36 @@ def debug_modal_state(prefix="debug"):
         print(f"⚠️ Falha no debug_modal_state: {type(e).__name__} | {repr(e)}")
 
 
+def _fechar_todos_modais_js():
+    """Fecha todos os modais via JavaScript puro — não depende de referências Selenium."""
+    try:
+        driver.execute_script(
+            """
+            document.querySelectorAll('.modal').forEach(function(m) {
+                m.style.display = 'none';
+                m.classList.remove('in', 'show');
+            });
+            document.body.classList.remove('modal-open');
+            document.body.style.paddingRight = '';
+            document.querySelectorAll('.modal-backdrop').forEach(function(b) { b.remove(); });
+            """
+        )
+    except Exception:
+        pass
+
+
 def close_any_open_modal():
     try:
         for _ in range(3):
             modals = driver.find_elements(By.CSS_SELECTOR, ".modal-dialog, .modal-content")
-            visible_modals = [m for m in modals if m.is_displayed()]
+            # StaleElement-safe: verifica is_displayed() individualmente
+            visible_modals = []
+            for m in modals:
+                try:
+                    if m.is_displayed():
+                        visible_modals.append(m)
+                except Exception:
+                    pass
             if not visible_modals:
                 return
 
@@ -157,21 +183,13 @@ def close_any_open_modal():
                     pass
 
             if not clicked:
-                driver.execute_script(
-                    """
-                    document.querySelectorAll('.modal').forEach(m => {
-                        m.style.display = 'none';
-                        m.classList.remove('in');
-                    });
-                    document.body.classList.remove('modal-open');
-                    document.querySelectorAll('.modal-backdrop').forEach(b => b.remove());
-                    """
-                )
+                _fechar_todos_modais_js()
                 time.sleep(1)
 
         print("🧹 Modais fechados/limpos.")
     except Exception as exc:
         print(f"⚠️ Falha ao fechar modais: {type(exc).__name__} | {repr(exc)}")
+        _fechar_todos_modais_js()
 
 
 def close_known_popup_modals():
@@ -960,6 +978,19 @@ def process_part_1_collect_and_disable_vivareal():
         except TimeoutException:
             print(f"✅ Página {pagina} sem imóveis para processar.")
 
+        # Diagnóstico antes de iniciar o loop da página
+        if pagina == 1:
+            print("\n🔍 DIAGNÓSTICO PRÉ-PARTE 1")
+            try:
+                contadores = driver.find_elements(By.XPATH, "//*[contains(text(),'registros encontrados')]")
+                if contadores:
+                    print(f"   📊 Filtro: {contadores[0].text.strip()}")
+            except Exception:
+                pass
+            btns_pre = driver.find_elements(By.XPATH, "//button[contains(@onclick,'mdImovelUpdate')]")
+            print(f"   📊 Botões editar visíveis: {len(btns_pre)}")
+            print(f"   🌐 URL: {driver.current_url}")
+
         tentativas_pagina = 0
         while True:
             tentativas_pagina += 1
@@ -967,10 +998,22 @@ def process_part_1_collect_and_disable_vivareal():
                 print(f"⛔ Limite de {MAX_TENTATIVAS_PARTE_1} tentativas atingido na página {pagina}. Encerrando.")
                 break
 
+            # Antes de contar botões, garantir que não há modal bloqueando
+            _fechar_todos_modais_js()
+
             buttons = driver.find_elements(By.XPATH, "//button[contains(@onclick,'mdImovelUpdate')]")
             if not buttons:
-                print("✅ Nenhum imóvel restante na lista filtrada desta página.")
-                break
+                # Tenta fechar modal residual e re-verifica uma vez antes de desistir
+                close_any_open_modal()
+                time.sleep(1.5)
+                _fechar_todos_modais_js()
+                time.sleep(0.5)
+                buttons = driver.find_elements(By.XPATH, "//button[contains(@onclick,'mdImovelUpdate')]")
+                if not buttons:
+                    print("✅ Nenhum imóvel restante na lista filtrada desta página.")
+                    break
+                print(f"ℹ️ Modal estava bloqueando lista. Continuando com {len(buttons)} botão(ões).")
+                continue
 
             print(f"📌 Imóveis restantes na lista filtrada: {len(buttons)} | 🔢 Tentativa {tentativas_pagina}/{MAX_TENTATIVAS_PARTE_1}")
 
@@ -2265,25 +2308,31 @@ def _iniciar_chrome_com_retry(options, usando_headless):
     )
 
 
-def _enviar_notificacao_final(status, inicio_execucao, encontrados, restaurados):
+def _enviar_notificacao_final(status, inicio_execucao, encontrados, restaurados, codigos=None):
     try:
         from email.mime.text import MIMEText
         gmail_service = _gmail_autenticar()
         data    = datetime.now().strftime("%d/%m/%Y %H:%M")
         duracao = str(datetime.now() - inicio_execucao).split(".")[0]
-        icone   = "✅" if status == "SUCCESS" else "❌"
-        assunto = (f"{icone} Atualização ZAP — SUCESSO ({datetime.now().strftime('%d/%m/%Y')})"
-                   if status == "SUCCESS"
-                   else f"{icone} Atualização ZAP — FALHA: {status} ({datetime.now().strftime('%d/%m/%Y')})")
+        if status == "SUCCESS":
+            icone, titulo = "✅", "SUCESSO"
+        elif status.startswith("WARNING"):
+            icone, titulo = "⚠️", f"ALERTA: {status}"
+        else:
+            icone, titulo = "❌", f"FALHA: {status}"
+        assunto = f"{icone} Atualização ZAP — {titulo} ({datetime.now().strftime('%d/%m/%Y')})"
         corpo = (
             f"Execução do dia {data}\n\n"
             f"Status: {status}\n"
             f"Duração: {duracao}\n"
             f"Imóveis encontrados: {encontrados}\n"
-            f"Imóveis restaurados: {restaurados}\n\n"
-            f"Logs completos na VPS:\n"
-            f"/opt/atualizacao-zap/logs/\n"
+            f"Imóveis restaurados: {restaurados}\n"
         )
+        if codigos:
+            corpo += f"\nCódigos processados: {', '.join(str(c) for c in sorted(codigos))}\n"
+        if encontrados < EXPECTATIVA_MINIMA_PARTE_1 and encontrados > 0:
+            corpo += f"\n⚠️ ALERTA: apenas {encontrados} imóvel(is) processados (esperado >= {EXPECTATIVA_MINIMA_PARTE_1}).\n"
+        corpo += f"\nLogs na VPS: /opt/atualizacao-zap/logs/\n"
         msg = MIMEText(corpo)
         msg["to"]      = GMAIL_DESTINATARIO
         msg["subject"] = assunto
@@ -2510,9 +2559,16 @@ def main():
             arquivo_rollback,
             inicio_execucao,
         )
+        codigos_processados = [str(i.get("codigo","")) for i in imoveis_processados if i.get("codigo")]
+        status_notif = status_final
+        if (status_final == "SUCCESS"
+                and len(imoveis_processados) > 0
+                and len(imoveis_processados) < EXPECTATIVA_MINIMA_PARTE_1):
+            status_notif = "WARNING_POUCOS_IMOVEIS"
         _enviar_notificacao_final(
-            status_final, inicio_execucao,
-            len(imoveis_processados), len(restaurados_parte2)
+            status_notif, inicio_execucao,
+            len(imoveis_processados), len(restaurados_parte2),
+            codigos=codigos_processados
         )
         if driver and (em_nuvem or os.getenv("FECHAR_BROWSER", "") == "1"):
             try:
