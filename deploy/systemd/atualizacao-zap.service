@@ -1,0 +1,20 @@
+﻿[Unit]
+Description=Atualizacao ZAP diaria
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/atualizacao-zap
+Environment=PYTHONUTF8=1
+Environment=PYTHONIOENCODING=utf-8
+Environment=RUN_HEADLESS=1
+Environment=CI=true
+ExecStart=/opt/atualizacao-zap/venv/bin/python /opt/atualizacao-zap/atualizacao_zap.py
+StandardOutput=append:/opt/atualizacao-zap/logs/systemd.log
+StandardError=append:/opt/atualizacao-zap/logs/systemd.log
+User=root
+Group=root
+
+[Install]
+WantedBy=multi-user.target

@@ -1,9 +1,11 @@
 import base64
 import json
 import os
+import platform
 import re
 import shutil
 import subprocess
+import sys
 import traceback
 from datetime import datetime, timedelta
 import time
@@ -52,11 +54,16 @@ CANAL_PRO_URL_LOGIN    = "https://canalpro.grupozap.com/login"
 CANAL_PRO_URL_LISTINGS = "https://canalpro.grupozap.com/ZAP_OLX/0/listings"
 VERIFICACAO_INTERVALO_SEGUNDOS = 1800  # 30 minutos entre verificações
 VERIFICACAO_TIMEOUT_SEGUNDOS   = 8 * 3600  # timeout máximo de 8 horas
+MINIMO_CODIGOS_ESPERADOS_CANAL_PRO = 10
+MAX_ERROS_CONSECUTIVOS_SCRAPING = 5
 # Aliases para compatibilidade
 CANALPRO_LOGIN_URL = CANAL_PRO_URL_LOGIN
 CANALPRO_LISTINGS_BASE_URL = CANAL_PRO_URL_LISTINGS
 POLLING_INTERVAL_SECONDS = VERIFICACAO_INTERVALO_SEGUNDOS
 MAX_WAIT_SECONDS = VERIFICACAO_TIMEOUT_SEGUNDOS
+SCHEDULED_TASK_NAME = "Atualizar Imóveis"
+ALVO_EXECUCAO_HORA = 23
+ALVO_EXECUCAO_MINUTO = 0
 
 CATEGORIAS_VIVAREAL = {
     "0": "Simples",
@@ -77,6 +84,9 @@ SAFE_MODE     = os.getenv("SAFE_MODE", "false").lower() == "true"
 
 CHECKPOINT_DIR = "state"
 os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+RUNS_DIR = os.path.join(CHECKPOINT_DIR, "runs")
+ARCHIVE_DIR = os.path.join(CHECKPOINT_DIR, "archive")
+IMOVEIS_PARTE1_PATH = "imoveis_parte1.json"
 
 # === CONFIGURACOES PROXY WEBSHARE (Brasil) ===
 PROXY_ATIVO  = os.getenv("PROXY_ATIVO", "false").lower() == "true"
@@ -85,10 +95,11 @@ PROXY_PORTA  = "80"
 PROXY_USUARIO = os.getenv("PROXY_USUARIO", "jecuapfw-br-1")
 PROXY_SENHA  = os.getenv("PROXY_SENHA", "8a7gx6ckzexa")
 
-# Inicializados dentro de main() após wait_until_10am()
+# Inicializados dentro de main() após decisão de espera interna
 driver = None
 wait = None
 actions = None
+HEALTHCHECK_ONLY = "--healthcheck" in sys.argv
 
 
 # =============================================================================
@@ -854,6 +865,99 @@ def go_to_integracoes_parceiros_and_update_vivareal():
 # =============================================================================
 
 _CHECKPOINT_PATH = None   # preenchido em _checkpoint_criar()
+_RUN_CONTEXT = {
+    "run_id": None,
+    "mode": "unknown",
+    "run_state_path": None,
+}
+
+
+def _state_archive_file(path, motivo):
+    if not path or not os.path.exists(path):
+        return None
+    os.makedirs(ARCHIVE_DIR, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    base = os.path.basename(path)
+    destino = os.path.join(ARCHIVE_DIR, f"{base}.{motivo}.{ts}")
+    try:
+        shutil.move(path, destino)
+        print(f"🗃️ Estado antigo arquivado: {path} -> {destino}")
+        return destino
+    except Exception as exc:
+        print(f"⚠️ Falha ao arquivar estado antigo ({path}): {exc}")
+        return None
+
+
+def _criar_run_context(teste_local, em_nuvem):
+    origem = "teste" if teste_local else ("agendado" if em_nuvem else "manual")
+    run_id = datetime.now().strftime("%Y%m%d_%H%M%S") + f"_{origem}"
+    os.makedirs(RUNS_DIR, exist_ok=True)
+    run_state_path = os.path.join(RUNS_DIR, f"run_{run_id}.json")
+    _RUN_CONTEXT["run_id"] = run_id
+    _RUN_CONTEXT["mode"] = origem
+    _RUN_CONTEXT["run_state_path"] = run_state_path
+    print(f"🧾 run_id da execução: {run_id} | modo={origem}")
+    return run_id
+
+
+def _run_state_salvar(status, imoveis=None):
+    run_id = _RUN_CONTEXT.get("run_id")
+    run_state_path = _RUN_CONTEXT.get("run_state_path")
+    if not run_id or not run_state_path:
+        return
+    payload = {
+        "run_id": run_id,
+        "mode": _RUN_CONTEXT.get("mode"),
+        "status": status,
+        "updated_at": datetime.now().isoformat(),
+        "imoveis": imoveis or [],
+    }
+    with open(run_state_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+
+
+def _preparar_estado_inicio_execucao(modo_resume=False, teste_local=False):
+    """
+    Em execução normal, evita reutilização indevida de estado antigo.
+    Em modo resume (MODO_PULAR_PARTE_1), preserva o arquivo atual.
+    """
+    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+    os.makedirs(RUNS_DIR, exist_ok=True)
+    os.makedirs(ARCHIVE_DIR, exist_ok=True)
+
+    if modo_resume:
+        print("♻️ Execução em modo resume: estado atual será preservado para retomada.")
+        return
+
+    if teste_local:
+        print("🧪 Execução de teste/manual: não vou alterar o arquivo de estado oficial da agenda.")
+        return
+
+    if os.path.exists(IMOVEIS_PARTE1_PATH):
+        try:
+            with open(IMOVEIS_PARTE1_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            status_antigo = (data.get("status") or "").upper()
+            run_id_antigo = data.get("run_id")
+            if status_antigo == "SUCCESS":
+                _state_archive_file(IMOVEIS_PARTE1_PATH, "execucao_concluida")
+            else:
+                _state_archive_file(IMOVEIS_PARTE1_PATH, "estado_antigo_ignorado")
+            print(f"ℹ️ Estado anterior ignorado para nova execução limpa (run_id antigo={run_id_antigo}).")
+        except Exception:
+            _state_archive_file(IMOVEIS_PARTE1_PATH, "json_invalido")
+
+    for file_name in os.listdir(RUNS_DIR):
+        p = os.path.join(RUNS_DIR, file_name)
+        if not os.path.isfile(p):
+            continue
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if (data.get("status") or "").upper() == "SUCCESS":
+                _state_archive_file(p, "run_concluido")
+        except Exception:
+            _state_archive_file(p, "run_json_invalido")
 
 def _checkpoint_criar(timestamp_str):
     """Cria o arquivo de checkpoint no início da Parte 1."""
@@ -862,6 +966,8 @@ def _checkpoint_criar(timestamp_str):
     _CHECKPOINT_PATH = os.path.join(CHECKPOINT_DIR, fname)
     data = {
         "timestamp": timestamp_str,
+        "run_id": _RUN_CONTEXT.get("run_id"),
+        "mode": _RUN_CONTEXT.get("mode"),
         "status": "IN_PROGRESS",
         "desmarcados": [],
     }
@@ -1781,102 +1887,335 @@ def _canal_pro_navigate_to_listings():
         print("✅ Página de Anúncios carregada (fallback URL).")
 
 
-def _canal_pro_collect_all_active_codes():
-    """
-    Varre todas as páginas de anúncios do Canal Pro e retorna um set com
-    todos os códigos ativos. Retorna None apenas se MAIS DE UMA página
-    diferente retornar 0 sem confirmação de lista vazia (proteção contra
-    falso positivo por renderização lenta do React).
-    Anúncios com badge 'Bloqueado' ainda constam na listagem e são ATIVOS.
-    """
-    all_codes = set()
-    page = 1
-    paginas_invalidas = 0
-    MAX_TENTATIVAS_PAGINA = 3
-    wait_cards = WebDriverWait(driver, 15)
-
-    def _lista_vazia_confirmada():
-        try:
-            body_text = (driver.find_element(By.TAG_NAME, "body").text or "").lower()
-            if any(t in body_text for t in ["nenhum anúncio", "0 anúncios", "nenhum resultado", "sem anúncios"]):
-                return True
-            driver.find_element(By.XPATH, "//*[contains(normalize-space(.),'de 0')]")
-            return True
-        except Exception:
-            return False
-
-    def _coletar_codigos_pagina():
-        elements = driver.find_elements(By.CSS_SELECTOR, "span.card-content__tag")
-        codes = set()
-        for el in elements:
+def _canal_pro_obter_contador_oficial_texto():
+    seletores = [
+        "div.pagination span",
+        "div.pagination",
+        "[data-testid='pagination']",
+        "span.pagination__label",
+    ]
+    for sel in seletores:
+        for el in driver.find_elements(By.CSS_SELECTOR, sel):
             try:
-                code = (el.text or "").strip()
-                if code.isdigit():
-                    codes.add(code)
+                txt = (el.text or "").strip()
+                if re.search(r"\d+\s*-\s*\d+\s*de\s*\d+", txt.lower()) or re.search(r"\b\d+\s*de\s*\d+\b", txt.lower()):
+                    return txt
             except Exception:
                 pass
-        return codes
+    body = (driver.find_element(By.TAG_NAME, "body").text or "")
+    m = re.search(r"\b\d+\s*-\s*\d+\s*de\s*\d+\b", body, flags=re.IGNORECASE)
+    if m:
+        return m.group(0)
+    return ""
+
+
+def _canal_pro_lista_vazia_confirmada():
+    body_text = (driver.find_element(By.TAG_NAME, "body").text or "").lower()
+    frases_vazio = [
+        "nenhum anúncio",
+        "nenhum anuncio",
+        "0 anúncios",
+        "0 anuncios",
+        "nenhum resultado",
+        "sem anúncios",
+        "sem anuncios",
+    ]
+    if any(f in body_text for f in frases_vazio):
+        return True, "mensagem_oficial_lista_vazia"
+
+    contador = (_canal_pro_obter_contador_oficial_texto() or "").lower()
+    if re.search(r"\b0\s*-\s*0\s*de\s*0\b", contador) or re.search(r"\b0\s*de\s*0\b", contador):
+        return True, f"contador_oficial={contador}"
+
+    return False, "sem_confirmacao_oficial_de_lista_vazia"
+
+
+def sessao_canal_pro_expirada(driver_ref):
+    try:
+        url = (driver_ref.current_url or "").lower()
+    except Exception:
+        return True
+
+    if "login" in url or "auth" in url:
+        return True
+
+    if driver_ref.find_elements(By.CSS_SELECTOR, "input[type='password'], input[name='password']"):
+        return True
+    if driver_ref.find_elements(By.CSS_SELECTOR, "input[name='email'], input[type='email']"):
+        return True
+
+    tem_cards = len(driver_ref.find_elements(By.CSS_SELECTOR, "span.card-content__tag")) > 0
+    contador = _canal_pro_obter_contador_oficial_texto()
+    if not tem_cards and not contador:
+        body_text = (driver_ref.find_element(By.TAG_NAME, "body").text or "").lower()
+        if any(t in body_text for t in ["entrar", "autenticação", "autenticacao", "verificar código", "verificar codigo"]):
+            return True
+
+    return False
+
+
+def coletar_codigos_pagina_com_retry(driver_ref, pagina_atual, max_tentativas=3):
+    motivo_final = "indefinido"
+    for tentativa in range(1, max_tentativas + 1):
+        try:
+            WebDriverWait(driver_ref, 12).until(
+                lambda d: len(d.find_elements(By.CSS_SELECTOR, "span.card-content__tag")) > 0
+                or _canal_pro_lista_vazia_confirmada()[0]
+            )
+        except Exception:
+            pass
+
+        codigos = set()
+        cards = driver_ref.find_elements(By.CSS_SELECTOR, "span.card-content__tag")
+        for el in cards:
+            try:
+                texto = (el.text or "").strip()
+                if texto.isdigit():
+                    codigos.add(texto)
+            except Exception:
+                pass
+
+        if codigos:
+            return {
+                "sucesso": True,
+                "codigos": codigos,
+                "lista_vazia_confirmada": False,
+                "motivo": f"codigos_coletados_na_tentativa_{tentativa}",
+            }
+
+        lista_vazia, motivo_vazio = _canal_pro_lista_vazia_confirmada()
+        if lista_vazia:
+            return {
+                "sucesso": True,
+                "codigos": set(),
+                "lista_vazia_confirmada": True,
+                "motivo": motivo_vazio,
+            }
+
+        motivo_final = (
+            f"pagina_{pagina_atual}_retornou_0_codigos_sem_confirmacao_oficial_de_lista_vazia"
+            f"_tentativa_{tentativa}"
+        )
+        if tentativa < max_tentativas:
+            print(f"   ⚠️ Página {pagina_atual} retornou 0 códigos (tentativa {tentativa}/{max_tentativas}). Aguardando 3s...")
+            time.sleep(3)
+            driver_ref.execute_script("window.scrollTo(0, 300);")
+            time.sleep(1)
+            driver_ref.execute_script("window.scrollTo(0, 0);")
+            time.sleep(1)
+
+    return {
+        "sucesso": False,
+        "codigos": set(),
+        "lista_vazia_confirmada": False,
+        "motivo": motivo_final,
+    }
+
+
+def _canal_pro_botao_proxima_habilitado():
+    seletores = [
+        "button[aria-label='Próxima Página']",
+        "button[aria-label='Próxima pagina']",
+        "button[aria-label='Next Page']",
+        "button.pagination__button--next",
+    ]
+    for sel in seletores:
+        elems = driver.find_elements(By.CSS_SELECTOR, sel)
+        if not elems:
+            continue
+        btn = elems[0]
+        classe = (btn.get_attribute("class") or "").lower()
+        disabled = (btn.get_attribute("disabled") or "").lower()
+        habilitado = btn.is_enabled() and "disabled" not in classe and disabled not in ("true", "disabled")
+        return btn, habilitado
+    return None, False
+
+
+def _canal_pro_ir_para_pagina_1():
+    url = CANAL_PRO_URL_LISTINGS
+    if "?" in url:
+        url += "&pageNumber=1"
+    else:
+        url += "?pageNumber=1"
+    driver.get(url)
+    time.sleep(2)
+    _canal_pro_handle_cookie_popup()
+
+
+def _canal_pro_collect_all_active_codes(ultimo_total_valido=0):
+    all_codes = set()
+    page = 1
+    paginas_ok = 0
+    paginas_falhas = 0
+    lista_vazia_confirmada_global = False
+
+    _canal_pro_ir_para_pagina_1()
 
     while True:
-        # Aguarda cards ou mensagem de lista vazia
-        try:
-            wait_cards.until(
-                lambda d: len(d.find_elements(By.CSS_SELECTOR, "span.card-content__tag")) > 0
-                or any(
-                    t in (d.find_element(By.TAG_NAME, "body").text or "").lower()
-                    for t in ["nenhum anúncio", "0 anúncios", "nenhum resultado", "sem anúncios"]
-                )
-            )
-        except Exception:
-            time.sleep(3)
+        resultado_pagina = coletar_codigos_pagina_com_retry(driver, pagina_atual=page, max_tentativas=3)
+        if not resultado_pagina["sucesso"]:
+            paginas_falhas += 1
+            return {
+                "erro_scraping": True,
+                "motivo": resultado_pagina["motivo"],
+                "codigos_ativos": all_codes,
+                "total_codigos_ativos": len(all_codes),
+                "paginas_sucesso": paginas_ok,
+                "paginas_falhas": paginas_falhas,
+                "lista_vazia_confirmada_global": False,
+            }
 
-        # Tentativas por página para lidar com renderização lenta do React
-        page_codes = set()
-        for tentativa_pag in range(1, MAX_TENTATIVAS_PAGINA + 1):
-            page_codes = _coletar_codigos_pagina()
+        paginas_ok += 1
+        codigos_pagina = resultado_pagina["codigos"]
+        if resultado_pagina["lista_vazia_confirmada"] and page == 1:
+            lista_vazia_confirmada_global = True
 
-            if page_codes:
-                break  # sucesso
+        print(f"   📄 Página {page}: {len(codigos_pagina)} código(s) coletado(s): {sorted(codigos_pagina)}")
+        all_codes.update(codigos_pagina)
 
-            if _lista_vazia_confirmada():
-                break  # lista realmente vazia, aceitar 0
-
-            if tentativa_pag < MAX_TENTATIVAS_PAGINA:
-                print(f"   ⚠️ Página {page} retornou 0 códigos (tentativa {tentativa_pag}/{MAX_TENTATIVAS_PAGINA}). Aguardando 3s...")
-                time.sleep(3)
-                driver.execute_script("window.scrollTo(0, 300);")
-                time.sleep(1)
-                driver.execute_script("window.scrollTo(0, 0);")
-                time.sleep(1)
-            else:
-                print(f"   ⚠️ Página {page} retornou 0 códigos após {MAX_TENTATIVAS_PAGINA} tentativas. Pulando página.")
-                paginas_invalidas += 1
-
-        sorted_codes = sorted(page_codes)
-        print(f"   📄 Página {page}: {len(page_codes)} código(s) coletado(s): {sorted_codes}")
-        all_codes.update(page_codes)
-
-        # Só invalida o resultado inteiro se mais de uma página diferente falhou
-        if paginas_invalidas > 1:
-            print("   ⚠️ AVISO: Múltiplas páginas retornaram 0 códigos sem confirmação. Dado inválido.")
-            return None
-
-        # Verifica próxima página
-        try:
-            next_btn = driver.find_element(
-                By.CSS_SELECTOR,
-                "button[aria-label='Próxima Página'], button.pagination__button--next"
-            )
-            if next_btn.is_enabled() and "disabled" not in (next_btn.get_attribute("class") or ""):
-                safe_click(next_btn)
-                time.sleep(2)
-                page += 1
-            else:
-                break
-        except Exception:
+        btn_next, habilitado = _canal_pro_botao_proxima_habilitado()
+        if not habilitado:
             break
+        safe_click(btn_next)
+        time.sleep(2)
+        page += 1
 
-    return all_codes
+    total = len(all_codes)
+    if paginas_ok < 1:
+        return {
+            "erro_scraping": True,
+            "motivo": "nenhuma_pagina_processada_com_sucesso",
+            "codigos_ativos": all_codes,
+            "total_codigos_ativos": total,
+            "paginas_sucesso": paginas_ok,
+            "paginas_falhas": paginas_falhas,
+            "lista_vazia_confirmada_global": lista_vazia_confirmada_global,
+        }
+
+    if total < MINIMO_CODIGOS_ESPERADOS_CANAL_PRO and not lista_vazia_confirmada_global:
+        return {
+            "erro_scraping": True,
+            "motivo": f"total_suspeito_abaixo_do_minimo({total}<{MINIMO_CODIGOS_ESPERADOS_CANAL_PRO})",
+            "codigos_ativos": all_codes,
+            "total_codigos_ativos": total,
+            "paginas_sucesso": paginas_ok,
+            "paginas_falhas": paginas_falhas,
+            "lista_vazia_confirmada_global": lista_vazia_confirmada_global,
+        }
+
+    if ultimo_total_valido >= MINIMO_CODIGOS_ESPERADOS_CANAL_PRO and total == 0 and not lista_vazia_confirmada_global:
+        return {
+            "erro_scraping": True,
+            "motivo": f"queda_improvavel_de_{ultimo_total_valido}_para_0_sem_confirmacao_oficial",
+            "codigos_ativos": all_codes,
+            "total_codigos_ativos": total,
+            "paginas_sucesso": paginas_ok,
+            "paginas_falhas": paginas_falhas,
+            "lista_vazia_confirmada_global": lista_vazia_confirmada_global,
+        }
+
+    return {
+        "erro_scraping": False,
+        "motivo": "varredura_valida",
+        "codigos_ativos": all_codes,
+        "total_codigos_ativos": total,
+        "paginas_sucesso": paginas_ok,
+        "paginas_falhas": paginas_falhas,
+        "lista_vazia_confirmada_global": lista_vazia_confirmada_global,
+    }
+
+
+def _avaliar_resultado_intermediario(codigos_alvo, resultado_varredura, ultimo_total_valido):
+    ativos = set(resultado_varredura.get("codigos_ativos") or set())
+    total_atual = int(resultado_varredura.get("total_codigos_ativos", len(ativos)))
+    lista_vazia_confirmada = bool(resultado_varredura.get("lista_vazia_confirmada_global"))
+    erro_scraping = bool(resultado_varredura.get("erro_scraping"))
+    motivo = resultado_varredura.get("motivo", "sem_motivo")
+
+    if not erro_scraping and ultimo_total_valido >= MINIMO_CODIGOS_ESPERADOS_CANAL_PRO and total_atual == 0 and not lista_vazia_confirmada:
+        erro_scraping = True
+        motivo = f"queda_improvavel_de_{ultimo_total_valido}_para_0_sem_confirmacao_oficial"
+
+    ainda_ativos = set(codigos_alvo) & ativos
+    return {
+        "erro_scraping": erro_scraping,
+        "motivo": motivo,
+        "ativos": ativos,
+        "total_atual": total_atual,
+        "ainda_ativos": ainda_ativos,
+        "todos_removidos": len(ainda_ativos) == 0 and not erro_scraping,
+    }
+
+
+def _deve_abortar_por_erros_consecutivos(erros_consecutivos, max_erros=MAX_ERROS_CONSECUTIVOS_SCRAPING):
+    return erros_consecutivos >= max_erros
+
+
+def _selftest_parte_intermediaria():
+    alvo = {"1018", "1146"}
+
+    c1 = _avaliar_resultado_intermediario(
+        codigos_alvo=alvo,
+        resultado_varredura={
+            "erro_scraping": True,
+            "motivo": "pagina_1_retornou_0_sem_confirmacao",
+            "codigos_ativos": set(),
+            "total_codigos_ativos": 0,
+            "lista_vazia_confirmada_global": False,
+        },
+        ultimo_total_valido=0,
+    )
+    assert c1["erro_scraping"] is True and c1["todos_removidos"] is False
+
+    c2 = _avaliar_resultado_intermediario(
+        codigos_alvo=alvo,
+        resultado_varredura={
+            "erro_scraping": False,
+            "motivo": "varredura_valida",
+            "codigos_ativos": set(),
+            "total_codigos_ativos": 0,
+            "lista_vazia_confirmada_global": False,
+        },
+        ultimo_total_valido=83,
+    )
+    assert c2["erro_scraping"] is True
+
+    c3 = _avaliar_resultado_intermediario(
+        codigos_alvo=alvo,
+        resultado_varredura={
+            "erro_scraping": False,
+            "motivo": "varredura_valida",
+            "codigos_ativos": {"1018", "9999"},
+            "total_codigos_ativos": 20,
+            "lista_vazia_confirmada_global": False,
+        },
+        ultimo_total_valido=20,
+    )
+    assert c3["todos_removidos"] is False and c3["erro_scraping"] is False
+
+    c4 = _avaliar_resultado_intermediario(
+        codigos_alvo=alvo,
+        resultado_varredura={
+            "erro_scraping": False,
+            "motivo": "varredura_valida",
+            "codigos_ativos": {"9999"},
+            "total_codigos_ativos": 15,
+            "lista_vazia_confirmada_global": False,
+        },
+        ultimo_total_valido=20,
+    )
+    assert c4["todos_removidos"] is True and c4["erro_scraping"] is False
+
+    erros = 0
+    abortou = False
+    for _ in range(5):
+        erros += 1
+        if _deve_abortar_por_erros_consecutivos(erros, 5):
+            abortou = True
+            break
+    assert abortou is True
+
+    print("✅ Self-test Parte Intermediária: cenários críticos validados.")
 
 
 def verify_properties_removed_from_zap(imoveis_processados):
@@ -1886,16 +2225,8 @@ def verify_properties_removed_from_zap(imoveis_processados):
     dos anúncios ativos. Só avança quando TODOS estiverem removidos.
     Timeout máximo: VERIFICACAO_TIMEOUT_SEGUNDOS.
     """
-    # Fallback: tenta carregar do JSON se lista vier vazia
     if not imoveis_processados:
-        try:
-            with open("imoveis_parte1.json", encoding="utf-8") as f:
-                data = json.load(f)
-                imoveis_processados = data.get("imoveis", [])
-            print(f"ℹ️ Lista carregada do imoveis_parte1.json ({len(imoveis_processados)} imóvel(is)).")
-        except Exception:
-            print("ℹ️ Nenhum imóvel na lista e imoveis_parte1.json não encontrado — verificação ignorada.")
-            return
+        raise Exception("ETAPA INTERMEDIÁRIA sem imóveis da ETAPA 1 da execução atual. Parte 2 bloqueada.")
 
     codigos_alvo = {str(item["codigo"]).strip() for item in imoveis_processados}
     print(f"\n🔍 Parte Intermediária: monitorando remoção de {len(codigos_alvo)} imóvel(is) no ZAP Imóveis...")
@@ -1912,6 +2243,8 @@ def verify_properties_removed_from_zap(imoveis_processados):
     tentativa = 1
 
     try:
+        erros_consecutivos = 0
+        ultimo_total_valido = 0
         while True:
             # Verifica timeout
             if time.time() - inicio > VERIFICACAO_TIMEOUT_SEGUNDOS:
@@ -1922,22 +2255,65 @@ def verify_properties_removed_from_zap(imoveis_processados):
             horario = datetime.now().strftime("%H:%M:%S")
             print(f"🔍 [{horario}] Verificação #{tentativa} — varrendo anúncios no Canal Pro...")
 
+            if sessao_canal_pro_expirada(driver):
+                print("⚠️ Sessão do Canal Pro expirada. Refazendo login...")
+                aba_crm = _canal_pro_login()
+                _canal_pro_navigate_to_listings()
+
             try:
-                ativos = _canal_pro_collect_all_active_codes()
+                resultado = _canal_pro_collect_all_active_codes(ultimo_total_valido=ultimo_total_valido)
             except Exception as exc:
                 print(f"⚠️ Erro ao coletar códigos: {type(exc).__name__} | {repr(exc)}")
-                ativos = None
+                resultado = {"erro_scraping": True, "motivo": f"excecao_{type(exc).__name__}", "codigos_ativos": set(), "total_codigos_ativos": 0}
 
-            if ativos is None:
-                print(f"   ⚠️ Resultado inválido — aguardando {VERIFICACAO_INTERVALO_SEGUNDOS // 60} min antes de tentar novamente.")
+            avaliacao = _avaliar_resultado_intermediario(
+                codigos_alvo=codigos_alvo,
+                resultado_varredura=resultado,
+                ultimo_total_valido=ultimo_total_valido,
+            )
+
+            if avaliacao.get("erro_scraping"):
+                erros_consecutivos += 1
+                contador = _canal_pro_obter_contador_oficial_texto()
+                cards = len(driver.find_elements(By.CSS_SELECTOR, "span.card-content__tag"))
+                lista_vazia, _ = _canal_pro_lista_vazia_confirmada()
+                login_visivel = sessao_canal_pro_expirada(driver)
+                print("⛔ VERIFICAÇÃO INVÁLIDA")
+                print(f"   Motivo: {avaliacao.get('motivo')}")
+                print(f"   URL atual: {driver.current_url}")
+                print(f"   Cards encontrados: {cards}")
+                print(f"   Contador oficial: {contador or 'não encontrado'}")
+                print(f"   Tela de login detectada: {login_visivel}")
+                print(f"   Mensagem oficial de lista vazia: {lista_vazia}")
+                print(f"   Total coletado: {avaliacao.get('total_atual', 0)}")
+                print(f"   Último total válido conhecido: {ultimo_total_valido}")
+                print("   A Parte 2 NÃO será executada.")
+
+                if erros_consecutivos >= MAX_ERROS_CONSECUTIVOS_SCRAPING:
+                    pendentes = sorted(codigos_alvo)
+                    msg = (
+                        "PARTE_INTERMEDIARIA_ABORTADA: erros consecutivos de scraping no Canal Pro. "
+                        "Parte 2 não executada. Imóveis podem estar desmarcados no CRM/VivaReal e exigem atenção manual. "
+                        f"Códigos pendentes: {pendentes}"
+                    )
+                    raise Exception(msg)
+
+                print(f"   ⚠️ Erros consecutivos: {erros_consecutivos}/{MAX_ERROS_CONSECUTIVOS_SCRAPING}")
+                print(f"   ⏱️ Nova tentativa em {VERIFICACAO_INTERVALO_SEGUNDOS // 60} minuto(s).")
                 time.sleep(VERIFICACAO_INTERVALO_SEGUNDOS)
                 tentativa += 1
                 _canal_pro_navigate_to_listings()
                 continue
 
-            print(f"   📊 Total de códigos ativos no Canal Pro: {len(ativos)}")
+            erros_consecutivos = 0
+            ativos = avaliacao["ativos"]
+            total_ativos = avaliacao["total_atual"]
+            if total_ativos >= MINIMO_CODIGOS_ESPERADOS_CANAL_PRO or resultado.get("lista_vazia_confirmada_global"):
+                ultimo_total_valido = total_ativos
 
-            ainda_ativos = codigos_alvo & ativos
+            print(f"   📊 Total de códigos ativos no Canal Pro: {total_ativos}")
+
+            ainda_ativos = avaliacao["ainda_ativos"]
             ja_removidos = codigos_alvo - ativos
 
             if ja_removidos:
@@ -1946,7 +2322,7 @@ def verify_properties_removed_from_zap(imoveis_processados):
             if not ainda_ativos:
                 print("✅ TODOS os imóveis confirmados como removidos do ZAP Imóveis!")
                 print("🔒 Fechando aba do Canal Pro e retornando ao CRM...\n")
-                return
+                return True
 
             proxima = datetime.now().strftime("%H:%M:%S")
             print(f"   ⏳ Ainda ativos no ZAP ({len(ainda_ativos)} imóvel(is)): {sorted(ainda_ativos)}")
@@ -2181,17 +2557,95 @@ def _imprimir_resumo(status, encontrados, restaurados, falhas, falhas_lista,
 # AGENDAMENTO
 # =============================================================================
 
-def wait_until_10am():
-    """Aguarda até as 23:00 h do dia atual (ou do próximo dia, se já passou)."""
+def wait_until_target_time():
+    """Aguarda até o horário alvo de execução (23:00 por padrão)."""
     now = datetime.now()
-    target = now.replace(hour=23, minute=0, second=0, microsecond=0)
-    if now >= target:
+    target = now.replace(hour=ALVO_EXECUCAO_HORA, minute=ALVO_EXECUCAO_MINUTO, second=0, microsecond=0)
+    if now > target:
         target += timedelta(days=1)
     delta = (target - now).total_seconds()
     if delta > 0:
-        print(f"⏰ Aguardando até {target.strftime('%d/%m/%Y %H:%M:%S')} para iniciar...")
+        print(f"⏰ Modo espera interna ativo. Aguardando até {target.strftime('%d/%m/%Y %H:%M:%S')} para iniciar...")
         time.sleep(delta)
-    print("🕙 23:00 — iniciando execução.")
+    print(f"🕙 {ALVO_EXECUCAO_HORA:02d}:{ALVO_EXECUCAO_MINUTO:02d} — iniciando execução.")
+
+
+def _diagnostico_agendador_windows():
+    """
+    Diagnóstico do agendamento automático (Windows Task Scheduler).
+    Não aborta a execução; imprime alertas para evitar falhas silenciosas.
+    """
+    if platform.system().lower() != "windows":
+        print("ℹ️ Diagnóstico de agendador: sistema não-Windows, verificação do Task Scheduler ignorada.")
+        return
+
+    problemas = []
+    py_exec = subprocess.run(
+        ["where", "python"],
+        capture_output=True, text=True, shell=True
+    )
+    python_path = (py_exec.stdout or "").strip().splitlines()
+    python_path = python_path[0] if python_path else ""
+    script_path = os.path.abspath("atualizacao_zap.py")
+    cwd = os.path.abspath(".")
+    agora = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+
+    print("\n🧭 Diagnóstico do agendamento (Windows)")
+    print(f"   Horário atual: {agora}")
+    print(f"   Horário alvo: {ALVO_EXECUCAO_HORA:02d}:{ALVO_EXECUCAO_MINUTO:02d}")
+    print(f"   Script principal: {script_path}")
+    print(f"   Diretório atual: {cwd}")
+    print(f"   Python detectado: {python_path or 'NÃO ENCONTRADO'}")
+
+    if not os.path.exists(script_path):
+        problemas.append("Script principal não encontrado.")
+    if not python_path:
+        problemas.append("Python não encontrado no PATH.")
+
+    task = subprocess.run(
+        ["schtasks", "/query", "/tn", SCHEDULED_TASK_NAME, "/fo", "LIST", "/v"],
+        capture_output=True, text=True
+    )
+    if task.returncode != 0:
+        problemas.append(f"Tarefa '{SCHEDULED_TASK_NAME}' não encontrada no Agendador.")
+    else:
+        out = task.stdout or ""
+        def _extrair(rotulo):
+            m = re.search(rf"{re.escape(rotulo)}\s*:\s*(.+)", out, flags=re.IGNORECASE)
+            return m.group(1).strip() if m else "N/A"
+
+        status = _extrair("Status")
+        hora_inicio = _extrair("Hora de início")
+        acao = _extrair("Tarefa a ser executada")
+        iniciar_em = _extrair("Iniciar em")
+        modo_logon = _extrair("Modo de Logon")
+        ultima_exec = _extrair("Horário da última execução")
+        ultimo_resultado = _extrair("Último resultado")
+
+        print(f"   Tarefa encontrada: {SCHEDULED_TASK_NAME}")
+        print(f"   Status: {status}")
+        print(f"   Hora agendada: {hora_inicio}")
+        print(f"   Comando: {acao}")
+        print(f"   Iniciar em: {iniciar_em}")
+        print(f"   Modo de logon: {modo_logon}")
+        print(f"   Última execução: {ultima_exec}")
+        print(f"   Último resultado: {ultimo_resultado}")
+
+        if "desabilitado" in status.lower() or "desativado" in status.lower():
+            problemas.append("Tarefa está desabilitada.")
+        if "23:00:00" not in hora_inicio:
+            problemas.append(f"Horário incorreto no agendador ({hora_inicio}); esperado 23:00:00.")
+        if "executar_atualizacao_zap.bat" not in acao.lower() and "atualizacao_zap.py" not in acao.lower():
+            problemas.append("A tarefa não aponta para o launcher/binary esperado do projeto Atualizacao_ZAP.")
+        if iniciar_em.upper() == "N/A":
+            problemas.append("Campo 'Iniciar em' não definido (pode quebrar caminhos relativos).")
+
+    if problemas:
+        print("⚠️ Diagnóstico detectou inconsistências:")
+        for p in problemas:
+            print(f"   - {p}")
+    else:
+        print("✅ Diagnóstico de agendamento: OK.")
 
 
 # =============================================================================
@@ -2236,6 +2690,40 @@ def _healthcheck_inicial():
         return False
 
     print("✅ Healthcheck OK — todos os pré-requisitos atendidos.")
+    return True
+
+
+def _healthcheck_completo():
+    """
+    Healthcheck seguro: valida ambiente e encerra sem executar ETAPAS 1/2.
+    """
+    print("🩺 HEALTHCHECK MODE -- sem alterações de dados.")
+    ok = _healthcheck_inicial()
+    if not ok:
+        return False
+
+    checks = [
+        ("CRM_USUARIO", os.getenv("CRM_USUARIO")),
+        ("CRM_SENHA", os.getenv("CRM_SENHA")),
+        ("CANALPRO_EMAIL", os.getenv("CANALPRO_EMAIL")),
+        ("CANALPRO_SENHA", os.getenv("CANALPRO_SENHA")),
+    ]
+    faltantes = [k for k, v in checks if not v]
+    if faltantes:
+        print(f"⛔ Variáveis ausentes: {faltantes}")
+        return False
+
+    try:
+        os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+        os.makedirs("logs", exist_ok=True)
+        teste_log = os.path.join("logs", "healthcheck.log")
+        with open(teste_log, "a", encoding="utf-8") as f:
+            f.write(f"{datetime.now().isoformat()} healthcheck ok\n")
+    except Exception as exc:
+        print(f"⛔ Falha ao escrever logs/state: {exc}")
+        return False
+
+    print("✅ HEALTHCHECK concluído com sucesso.")
     return True
 
 
@@ -2352,16 +2840,43 @@ def main():
 
     em_nuvem = os.getenv("CI", "") == "true"
     teste_local = os.getenv("TEST_MODE", "") == "true"
-
-    # Localmente aguarda as 10h; em nuvem ou modo teste, inicia imediatamente
-    if not em_nuvem and not teste_local:
-        wait_until_10am()
+    usar_espera_interna = os.getenv("USAR_ESPERA_INTERNA", "false").lower() == "true"
+    run_id = _criar_run_context(teste_local=teste_local, em_nuvem=em_nuvem)
+    _preparar_estado_inicio_execucao(modo_resume=MODO_PULAR_PARTE_1, teste_local=teste_local)
+    _run_state_salvar(status="IN_PROGRESS", imoveis=[])
+    resume_file_env = os.getenv("RESUME_FILE", "").strip()
+    if MODO_PULAR_PARTE_1:
+        imoveis_parte1_path_run = resume_file_env or IMOVEIS_PARTE1_PATH
     elif teste_local:
-        print("🧪 MODO TESTE: pulando espera das 23h.")
+        imoveis_parte1_path_run = os.path.join(RUNS_DIR, f"imoveis_parte1_{run_id}.json")
+    else:
+        imoveis_parte1_path_run = IMOVEIS_PARTE1_PATH
+    print(f"🗂️ Arquivo de estado da execução atual: {imoveis_parte1_path_run}")
+
+    # Diagnóstico para alinhar código + Task Scheduler.
+    _diagnostico_agendador_windows()
+
+    # Com Task Scheduler diário, o padrão é iniciar imediatamente.
+    # A espera interna só é usada quando explicitamente habilitada via env.
+    if usar_espera_interna and not em_nuvem and not teste_local:
+        print(f"🕒 Execução manual com espera interna habilitada para {ALVO_EXECUCAO_HORA:02d}:{ALVO_EXECUCAO_MINUTO:02d}.")
+        wait_until_target_time()
+    elif teste_local:
+        print("🧪 MODO TESTE: execução imediata (espera interna desabilitada).")
+    else:
+        origem = "agendada/produção" if em_nuvem or not usar_espera_interna else "manual"
+        print(f"🚀 Execução {origem}: iniciando imediatamente às {datetime.now().strftime('%H:%M:%S')}.")
 
     print("🔍 Verificando pré-requisitos...")
     if not _healthcheck_inicial():
         raise Exception("Healthcheck falhou — abortando antes de iniciar.")
+    if HEALTHCHECK_ONLY:
+        if not _healthcheck_completo():
+            raise Exception("Healthcheck completo falhou.")
+        return
+    if os.getenv("SELFTEST_PARTE_INTERMEDIARIA", "false").lower() == "true":
+        _selftest_parte_intermediaria()
+        return
 
     options = Options()
     options.add_argument("--disable-notifications")
@@ -2442,17 +2957,27 @@ def main():
             print("\n⏭️ MODO TESTE: pulando Parte 1 (já executada anteriormente).")
             print("   Lendo imoveis_parte1.json para retomar Parte Intermediária...")
 
-            if not os.path.exists("imoveis_parte1.json"):
+            if not os.path.exists(imoveis_parte1_path_run):
                 raise Exception(
-                    "imoveis_parte1.json não encontrado. "
+                    f"Arquivo de resume não encontrado: {imoveis_parte1_path_run}. "
                     "Não é possível pular a Parte 1 sem esse arquivo."
                 )
 
-            with open("imoveis_parte1.json", "r", encoding="utf-8") as f:
+            with open(imoveis_parte1_path_run, "r", encoding="utf-8") as f:
                 data = json.load(f)
                 imoveis_processados = data.get("imoveis", [])
+            status_resume = (data.get("status") or "").upper()
+            run_id_resume = data.get("run_id")
+            if status_resume == "SUCCESS":
+                raise Exception(
+                    "Resume bloqueado: imoveis_parte1.json pertence a execução concluída com SUCCESS. "
+                    "Inicie execução normal para montar lista nova."
+                )
+            if not run_id_resume:
+                raise Exception("Resume bloqueado: arquivo imoveis_parte1.json sem run_id.")
 
-            print(f"📦 {len(imoveis_processados)} imóvel(is) carregados do JSON.")
+            print(f"📦 {len(imoveis_processados)} imóvel(is) carregados do JSON (run_id origem={run_id_resume}).")
+            _run_state_salvar(status="RESUMING_PREVIOUS_RUN", imoveis=imoveis_processados)
 
         else:
             # =====================================================================
@@ -2493,13 +3018,21 @@ def main():
             print("\n🚧 ===== PARTE 1: desmarcando VivaReal =====")
             imoveis_processados = process_part_1_collect_and_disable_vivareal()
             print(f"📦 Total de imóveis salvos para a Parte 2: {len(imoveis_processados)}")
+            print(f"🧾 ETAPA 1 ({run_id}) códigos desmarcados: {[str(i.get('codigo','')).strip() for i in imoveis_processados]}")
+            _run_state_salvar(status="PARTE_1_CONCLUIDA", imoveis=imoveis_processados)
 
-            with open("imoveis_parte1.json", "w", encoding="utf-8") as f:
+            with open(imoveis_parte1_path_run, "w", encoding="utf-8") as f:
                 json.dump(
-                    {"timestamp": datetime.now().isoformat(), "imoveis": imoveis_processados},
+                    {
+                        "run_id": run_id,
+                        "mode": _RUN_CONTEXT.get("mode"),
+                        "timestamp": datetime.now().isoformat(),
+                        "status": "IN_PROGRESS",
+                        "imoveis": imoveis_processados,
+                    },
                     f, ensure_ascii=False, indent=2
                 )
-            print("💾 imoveis_parte1.json salvo.")
+            print(f"💾 Estado da ETAPA 1 salvo para run_id={run_id}: {imoveis_parte1_path_run}")
 
             print("🚀 Atualizando VivaReal após Parte 1...")
             go_to_integracoes_parceiros_and_update_vivareal()
@@ -2508,12 +3041,17 @@ def main():
         # PARTE INTERMEDIÁRIA
         # =====================================================================
         print("\n🔍 ===== PARTE INTERMEDIÁRIA: verificando remoção no ZAP Imóveis =====")
-        verify_properties_removed_from_zap(imoveis_processados)
+        print(f"🧾 ETAPA INTERMEDIÁRIA ({run_id}) verificando {len(imoveis_processados)} imóvel(is) da execução atual.")
+        removidos_confirmados = verify_properties_removed_from_zap(imoveis_processados)
+        if not removidos_confirmados:
+            raise Exception("Parte 2 bloqueada: remoção no ZAP não foi confirmada.")
+        _run_state_salvar(status="PARTE_INTERMEDIARIA_CONFIRMADA", imoveis=imoveis_processados)
 
         # =====================================================================
         # PARTE 2: remarcar VivaReal
         # =====================================================================
         print("\n🚧 ===== PARTE 2: restaurando VivaReal =====")
+        print(f"🧾 ETAPA 2 ({run_id}) remarcará somente códigos da ETAPA 1: {[str(i.get('codigo','')).strip() for i in imoveis_processados]}")
         restaurados_parte2, falhas_parte2 = process_part_2_restore_vivareal(imoveis_processados)
 
         print("🚀 Atualizando VivaReal após Parte 2...")
@@ -2522,19 +3060,33 @@ def main():
         if falhas_parte2:
             arquivo_rollback = _gerar_arquivo_rollback_pendente(falhas_parte2, ts_str)
             status_final = "ERROR_AFTER_MUTATION_ROLLBACK_PENDING"
+            _run_state_salvar(status=status_final, imoveis=imoveis_processados)
         else:
             status_final = "SUCCESS"
             _checkpoint_fechar("SUCCESS")
+            _run_state_salvar(status="SUCCESS", imoveis=imoveis_processados)
+            if os.path.exists(imoveis_parte1_path_run):
+                try:
+                    with open(imoveis_parte1_path_run, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                    data["status"] = "SUCCESS"
+                    data["closed_at"] = datetime.now().isoformat()
+                    with open(imoveis_parte1_path_run, "w", encoding="utf-8") as f:
+                        json.dump(data, f, ensure_ascii=False, indent=2)
+                except Exception as exc:
+                    print(f"⚠️ Falha ao marcar arquivo de estado como SUCCESS: {exc}")
 
     except (InvalidSessionIdException, WebDriverException) as exc:
         cod = "ERROR_BROWSER_STARTUP" if "ERROR_BROWSER_STARTUP" in repr(exc) else "ERROR_BROWSER"
         print(f"\n⛔ {cod}: {type(exc).__name__} | {repr(exc)[:200]}")
         status_final = cod
+        _run_state_salvar(status=status_final, imoveis=imoveis_processados)
         _tentar_rollback_se_necessario(imoveis_processados, ts_str)
 
     except TimeoutError as exc:
         print(f"\n⛔ {exc}")
         status_final = "ERROR_TIMEOUT"
+        _run_state_salvar(status=status_final, imoveis=imoveis_processados)
         _tentar_rollback_se_necessario(imoveis_processados, ts_str)
 
     except Exception as exc:
@@ -2546,9 +3098,21 @@ def main():
         elif status_final == "ERROR_UNKNOWN":
             status_final = "ERROR_GENERAL"
         print(f"\n⛔ {status_final}: {type(exc).__name__} | {msg[:300]}")
+        _run_state_salvar(status=status_final, imoveis=imoveis_processados)
         _tentar_rollback_se_necessario(imoveis_processados, ts_str)
 
     finally:
+        if os.path.exists(imoveis_parte1_path_run):
+            try:
+                with open(imoveis_parte1_path_run, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if data.get("run_id") == run_id:
+                    data["status"] = status_final
+                    data["updated_at"] = datetime.now().isoformat()
+                    with open(imoveis_parte1_path_run, "w", encoding="utf-8") as f:
+                        json.dump(data, f, ensure_ascii=False, indent=2)
+            except Exception:
+                pass
         _checkpoint_fechar(status_final)
         _imprimir_resumo(
             status_final,
@@ -2582,4 +3146,12 @@ def main():
 
 
 if __name__ == "__main__":
+    try:
+        # Evita UnicodeEncodeError em execuções agendadas com console cp1252.
+        if hasattr(sys.stdout, "reconfigure"):
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        if hasattr(sys.stderr, "reconfigure"):
+            sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
     main()

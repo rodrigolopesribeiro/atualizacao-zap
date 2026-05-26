@@ -1,0 +1,10 @@
+﻿[Unit]
+Description=Timer diario Atualizacao ZAP as 23:00
+
+[Timer]
+OnCalendar=*-*-* 23:00:00
+Persistent=true
+Unit=atualizacao-zap.service
+
+[Install]
+WantedBy=timers.target

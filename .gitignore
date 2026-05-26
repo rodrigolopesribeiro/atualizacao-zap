@@ -20,6 +20,9 @@ env/
 
 # Logs
 *.log
+logs/
+state/
+*.bak_*
 
 # IDE
 .vscode/
