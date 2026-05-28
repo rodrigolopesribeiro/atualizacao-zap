@@ -78,7 +78,10 @@ CATEGORIAS_VIVAREAL = {
 # Quando True: pula a Parte 1, lê imoveis_parte1.json e começa na Parte Intermediária
 MODO_PULAR_PARTE_1 = False
 EXPECTATIVA_MINIMA_PARTE_1 = 5  # alerta se Parte 1 processar menos que isso
-MODO_HEADLESS = os.getenv("MODO_HEADLESS", "false").lower() == "true"
+MODO_HEADLESS = (
+    os.getenv("MODO_HEADLESS", "false").lower() == "true"
+    or os.getenv("RUN_HEADLESS", "0").lower() in ("1", "true", "yes")
+)
 DRY_RUN       = os.getenv("DRY_RUN",  "false").lower() == "true"
 SAFE_MODE     = os.getenv("SAFE_MODE", "false").lower() == "true"
 
@@ -100,6 +103,7 @@ driver = None
 wait = None
 actions = None
 HEALTHCHECK_ONLY = "--healthcheck" in sys.argv
+TEST_CANAL_PRO_LOGIN_ONLY = "--test-canal-pro-login" in sys.argv
 
 
 # =============================================================================
@@ -1484,7 +1488,10 @@ def _canal_pro_handle_cookie_popup():
         "button[class*='accept']",
         "button[class*='lgpd']",
     ]
-    generic_texts = {"aceitar", "aceitar todos", "accept", "ok", "concordo", "entendi", "salvar"}
+    generic_texts = {
+        "aceitar", "aceitar todos", "accept", "ok", "concordo",
+        "entendi", "salvar", "continuar", "rejeitar", "fechar"
+    }
     try:
         for sel in generic_selectors:
             try:
@@ -1539,32 +1546,266 @@ def _canal_pro_handle_cookie_popup():
     print("🍪 Nenhum pop-up de cookies detectado. Prosseguindo.")
 
 
+def _mask_value(value):
+    value = value or ""
+    if not value:
+        return ""
+    if len(value) <= 4:
+        return "*" * len(value)
+    return f"{value[:2]}***{value[-2:]}"
+
+
+def _safe_attr(el, attr):
+    try:
+        return el.get_attribute(attr) or ""
+    except Exception:
+        return ""
+
+
+def _element_summary(el):
+    try:
+        outer = _safe_attr(el, "outerHTML")
+        return {
+            "tag": (el.tag_name or "").lower(),
+            "type": _safe_attr(el, "type"),
+            "name": _safe_attr(el, "name"),
+            "id": _safe_attr(el, "id"),
+            "placeholder": _safe_attr(el, "placeholder"),
+            "aria-label": _safe_attr(el, "aria-label"),
+            "autocomplete": _safe_attr(el, "autocomplete"),
+            "text": (el.text or "").strip()[:300],
+            "href": _safe_attr(el, "href"),
+            "visible": el.is_displayed(),
+            "enabled": el.is_enabled(),
+            "value": _mask_value(_safe_attr(el, "value")),
+            "outerHTML": outer[:1000],
+        }
+    except Exception as exc:
+        return {"error": f"{type(exc).__name__}: {exc}"}
+
+
+def save_debug_snapshot(driver_ref, label):
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_label = re.sub(r"[^A-Za-z0-9_.-]+", "_", label).strip("_") or "snapshot"
+    out_dir = os.path.join("debug", f"{ts}_{safe_label}")
+    os.makedirs(out_dir, exist_ok=True)
+
+    metadata = {
+        "timestamp": datetime.now().isoformat(),
+        "label": label,
+        "ci": os.getenv("CI"),
+        "modo_headless": str(MODO_HEADLESS),
+        "pythonutf8": os.getenv("PYTHONUTF8"),
+        "pythonioencoding": os.getenv("PYTHONIOENCODING"),
+    }
+    try:
+        metadata.update({
+            "current_url": driver_ref.current_url,
+            "title": driver_ref.title,
+            "window_size": driver_ref.get_window_size(),
+            "user_agent": driver_ref.execute_script("return navigator.userAgent"),
+            "ready_state": driver_ref.execute_script("return document.readyState"),
+            "handles": driver_ref.window_handles,
+            "num_abas": len(driver_ref.window_handles),
+            "page_source_length": len(driver_ref.page_source or ""),
+        })
+    except Exception as exc:
+        metadata["metadata_error"] = f"{type(exc).__name__}: {exc}"
+
+    try:
+        driver_ref.save_screenshot(os.path.join(out_dir, "screenshot.png"))
+    except Exception as exc:
+        metadata["screenshot_error"] = f"{type(exc).__name__}: {exc}"
+
+    try:
+        with open(os.path.join(out_dir, "page.html"), "w", encoding="utf-8") as f:
+            f.write(driver_ref.page_source or "")
+    except Exception as exc:
+        metadata["html_error"] = f"{type(exc).__name__}: {exc}"
+
+    def _dump(name, elements):
+        with open(os.path.join(out_dir, name), "w", encoding="utf-8") as f:
+            json.dump([_element_summary(el) for el in elements], f, ensure_ascii=False, indent=2)
+
+    try:
+        _dump("inputs.json", driver_ref.find_elements(By.CSS_SELECTOR, "input, select, textarea"))
+        _dump("buttons.json", driver_ref.find_elements(By.CSS_SELECTOR, "button, [role='button'], input[type='submit']"))
+        _dump("links.json", driver_ref.find_elements(By.CSS_SELECTOR, "a"))
+    except Exception as exc:
+        metadata["elements_error"] = f"{type(exc).__name__}: {exc}"
+
+    with open(os.path.join(out_dir, "metadata.json"), "w", encoding="utf-8") as f:
+        json.dump(metadata, f, ensure_ascii=False, indent=2)
+
+    print(f"🧪 Debug snapshot salvo: {out_dir}")
+    return out_dir
+
+
+def _visible_enabled(elements):
+    result = []
+    for el in elements:
+        try:
+            if el.is_displayed() and el.is_enabled():
+                result.append(el)
+        except Exception:
+            pass
+    return result
+
+
+def _scroll_to_element(el):
+    driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
+    time.sleep(0.2)
+
+
+def _find_by_selectors(css_selectors=None, xpaths=None, timeout=30):
+    end = time.time() + timeout
+    css_selectors = css_selectors or []
+    xpaths = xpaths or []
+    last_seen = None
+    while time.time() < end:
+        for sel in css_selectors:
+            try:
+                found = _visible_enabled(driver.find_elements(By.CSS_SELECTOR, sel))
+                if found:
+                    _scroll_to_element(found[0])
+                    return found[0]
+            except Exception:
+                pass
+        for xp in xpaths:
+            try:
+                found = _visible_enabled(driver.find_elements(By.XPATH, xp))
+                if found:
+                    _scroll_to_element(found[0])
+                    return found[0]
+            except Exception:
+                pass
+        try:
+            last_seen = len(driver.find_elements(By.CSS_SELECTOR, "input, textarea, select"))
+        except Exception:
+            last_seen = None
+        time.sleep(1)
+    print(f"⚠️ Elemento não localizado após {timeout}s. Inputs vistos: {last_seen}")
+    return None
+
+
+def find_password_input(driver_ref, timeout=30):
+    return _find_by_selectors(
+        css_selectors=[
+            "input[type='password']",
+            "input[name*='password' i]",
+            "input[name*='senha' i]",
+            "input[id*='password' i]",
+            "input[id*='senha' i]",
+            "input[placeholder*='senha' i]",
+            "input[placeholder*='password' i]",
+            "input[autocomplete='current-password']",
+        ],
+        xpaths=[
+            "//*[self::input or self::textarea][contains(translate(@placeholder,'SENHAPASSWORD','senhapassword'),'senha')]",
+            "//*[self::input or self::textarea][contains(translate(@placeholder,'SENHAPASSWORD','senhapassword'),'password')]",
+            "//*[self::input or self::textarea][contains(translate(@name,'SENHAPASSWORD','senhapassword'),'senha')]",
+            "//*[self::input or self::textarea][contains(translate(@id,'SENHAPASSWORD','senhapassword'),'senha')]",
+        ],
+        timeout=timeout,
+    )
+
+
+def find_email_input(driver_ref, timeout=30):
+    el = _find_by_selectors(
+        css_selectors=[
+            "input[type='email']",
+            "input[name='email']",
+            "input[name='login']",
+            "input[name='username']",
+            "input[id*='email' i]",
+            "input[id*='login' i]",
+            "input[placeholder*='email' i]",
+            "input[placeholder*='e-mail' i]",
+            "input[aria-label*='email' i]",
+            "input[autocomplete='email']",
+            "input.l-input__item[type='text']",
+        ],
+        xpaths=[
+            "//*[self::input or self::textarea][contains(translate(@placeholder,'EMAIL','email'),'email')]",
+            "//*[self::input or self::textarea][contains(translate(@aria-label,'EMAIL','email'),'email')]",
+            "//*[self::input or self::textarea][contains(translate(@name,'EMAIL','email'),'email')]",
+            "//*[self::input or self::textarea][contains(translate(@id,'EMAIL','email'),'email')]",
+        ],
+        timeout=timeout,
+    )
+    if el:
+        return el
+
+    inputs = _visible_enabled(driver_ref.find_elements(By.CSS_SELECTOR, "input, textarea"))
+    password = find_password_input(driver_ref, timeout=2)
+    if password and inputs:
+        for idx, candidate in enumerate(inputs):
+            if candidate == password and idx > 0:
+                return inputs[idx - 1]
+    if len(inputs) >= 2:
+        return inputs[0]
+    return None
+
+
+def find_submit_button(driver_ref, timeout=15):
+    return _find_by_selectors(
+        css_selectors=["button[type='submit']", "input[type='submit']"],
+        xpaths=[
+            "//button[contains(translate(normalize-space(.),'ENTRARLOGINACESSARCONTINUAR','entrarloginacessarcontinuar'),'entrar')]",
+            "//button[contains(translate(normalize-space(.),'ENTRARLOGINACESSARCONTINUAR','entrarloginacessarcontinuar'),'login')]",
+            "//button[contains(translate(normalize-space(.),'ENTRARLOGINACESSARCONTINUAR','entrarloginacessarcontinuar'),'acessar')]",
+            "//button[contains(translate(normalize-space(.),'ENTRARLOGINACESSARCONTINUAR','entrarloginacessarcontinuar'),'continuar')]",
+        ],
+        timeout=timeout,
+    )
+
+
+def detect_canal_pro_page_state(driver_ref):
+    try:
+        url = (driver_ref.current_url or "").lower()
+        title = (driver_ref.title or "").lower()
+        body = (driver_ref.find_element(By.TAG_NAME, "body").text or "").lower()
+        source_len = len(driver_ref.page_source or "")
+        visible_inputs = _visible_enabled(driver_ref.find_elements(By.CSS_SELECTOR, "input, textarea"))
+        has_password = bool(_visible_enabled(driver_ref.find_elements(By.CSS_SELECTOR, "input[type='password'], input[name*='password' i], input[name*='senha' i]")))
+        has_email = bool(find_email_input(driver_ref, timeout=1))
+    except Exception:
+        return "UNKNOWN"
+
+    if "captcha" in body or "cloudflare" in body or "access denied" in body or "403" in title or "429" in body:
+        return "CAPTCHA_OR_BLOCK"
+    if "performance/home" in url or "/listings" in url or "anúncios" in body or "anuncios" in body:
+        return "ALREADY_LOGGED_IN"
+    if "acesso em um novo dispositivo" in body or "verificação" in body or "verificacao" in body or "código" in body or "codigo" in body:
+        return "TWO_FACTOR"
+    if "cookie" in body and any(t in body for t in ["aceitar", "salvar", "consent"]):
+        return "COOKIE_MODAL"
+    if has_email and has_password:
+        return "LOGIN_FORM"
+    if has_password and len(visible_inputs) <= 2:
+        return "PASSWORD_ONLY"
+    if source_len < 300 or not body.strip():
+        return "BLANK"
+    if "carregando" in body or "loading" in body:
+        return "LOADING"
+    return "UNKNOWN"
+
+
 def _canal_pro_login():
     """
-    Abre nova aba, faz login no Canal Pro e retorna o handle da aba do CRM.
-    Campos usam type='text' e são identificados pelo atributo name.
+    Abre nova aba, faz login no Canal Pro e retorna o handle anterior.
+    O login do Canal Pro muda com frequência; por isso este fluxo detecta
+    estados de página, salva evidências e usa localizadores tolerantes.
     """
     aba_crm = driver.current_window_handle
     print("🔐 Abrindo nova aba para o Canal Pro...")
     driver.execute_script("window.open('');")
     driver.switch_to.window(driver.window_handles[-1])
 
-    # PASSO 1 — Navegar para login
-    print("🔐 Navegando para a página de login do Canal Pro...")
-    driver.get(CANAL_PRO_URL_LOGIN)
-    time.sleep(2)
-
-    # PASSO 2 — Tratar pop-up de cookies
-    _canal_pro_handle_cookie_popup()
-
-    # Remove overlays residuais do banner
-    driver.execute_script(
-        "document.querySelectorAll('[class*=\"adopt-c-\"], [class*=\"cookie-overlay\"], [class*=\"backdrop\"]')"
-        ".forEach(el => { if (el.tagName !== 'BUTTON') el.style.display = 'none'; });"
-    )
-
     def _preencher_campo(campo, valor, nome):
         try:
+            _scroll_to_element(campo)
+            campo.click()
             campo.clear()
             campo.send_keys(valor)
         except Exception:
@@ -1593,93 +1834,138 @@ def _canal_pro_login():
             if valor_atual != valor:
                 raise Exception(f"Falha ao preencher campo '{nome}'. Esperado: '{valor}', obtido: '{valor_atual}'")
 
+    ultimo_snapshot = None
+    ultimo_erro = None
+
+    for tentativa in range(1, 4):
+        try:
+            print(f"🔐 Login Canal Pro tentativa {tentativa}/3...")
+            driver.get(CANAL_PRO_URL_LOGIN)
+            WebDriverWait(driver, 30).until(
+                lambda d: d.execute_script("return document.readyState") in ("interactive", "complete")
+            )
+            try:
+                driver.set_window_size(1920, 1080)
+            except Exception:
+                pass
+            time.sleep(3)
+
+            for _ in range(2):
+                _canal_pro_handle_cookie_popup()
+                time.sleep(0.5)
+
+            driver.execute_script(
+                "document.querySelectorAll('[class*=\"adopt-c-\"], [class*=\"cookie-overlay\"], [class*=\"backdrop\"]')"
+                ".forEach(el => { if (el.tagName !== 'BUTTON') el.style.display = 'none'; });"
+            )
+
+            estado = detect_canal_pro_page_state(driver)
+            print(f"🔎 Estado detectado no Canal Pro: {estado} | URL={driver.current_url} | title={driver.title}")
+
+            if estado == "ALREADY_LOGGED_IN":
+                if validate_canal_pro_logged_in(driver):
+                    print(f"✅ Canal Pro já estava logado. URL: {driver.current_url}")
+                    return aba_crm
+
+            if estado in ("UNKNOWN", "BLANK", "LOADING", "COOKIE_MODAL"):
+                ultimo_snapshot = save_debug_snapshot(driver, f"canal_pro_estado_{estado}_tentativa_{tentativa}")
+                if estado == "COOKIE_MODAL":
+                    _canal_pro_handle_cookie_popup()
+                driver.refresh()
+                time.sleep(4)
+                estado = detect_canal_pro_page_state(driver)
+                print(f"🔎 Estado após refresh: {estado}")
+
+            if estado == "CAPTCHA_OR_BLOCK":
+                ultimo_snapshot = save_debug_snapshot(driver, f"canal_pro_bloqueio_tentativa_{tentativa}")
+                raise Exception(f"ERROR_CANAL_PRO_LOGIN: bloqueio/captcha detectado. Evidências: {ultimo_snapshot}")
+
+            if estado == "TWO_FACTOR":
+                _canal_pro_handle_2fa()
+                if validate_canal_pro_logged_in(driver):
+                    return aba_crm
+
+            print("📝 Localizando campo de e-mail/login...")
+            email_field = find_email_input(driver, timeout=30)
+            if not email_field:
+                ultimo_snapshot = save_debug_snapshot(driver, f"canal_pro_email_nao_encontrado_tentativa_{tentativa}")
+                raise Exception(f"Campo de e-mail não encontrado. Evidências: {ultimo_snapshot}")
+
+            print("📝 Localizando campo de senha...")
+            senha_field = find_password_input(driver, timeout=30)
+            if not senha_field:
+                ultimo_snapshot = save_debug_snapshot(driver, f"canal_pro_senha_nao_encontrada_tentativa_{tentativa}")
+                raise Exception(f"Campo de senha não encontrado. Evidências: {ultimo_snapshot}")
+
+            print(f"📝 Preenchendo e-mail: {CANALPRO_EMAIL}")
+            _preencher_campo(email_field, CANALPRO_EMAIL, "email")
+            print("📝 Preenchendo senha: [oculta]")
+            _preencher_campo(senha_field, CANALPRO_SENHA, "senha")
+
+            print("🖱️ Submetendo login...")
+            btn_entrar = find_submit_button(driver, timeout=8)
+            if btn_entrar:
+                try:
+                    safe_click(btn_entrar)
+                except Exception:
+                    driver.execute_script("arguments[0].click();", btn_entrar)
+            else:
+                senha_field.send_keys(Keys.RETURN)
+
+            print("⏳ Aguardando resposta pós-login...")
+            status = _canal_pro_aguardar_pos_login()
+            if status == "2fa":
+                print("🔐 Detectada tela de 2FA (verificação em duas etapas).")
+                _canal_pro_handle_2fa()
+            elif status != "ok":
+                ultimo_snapshot = save_debug_snapshot(driver, f"canal_pro_pos_submit_inesperado_tentativa_{tentativa}")
+                raise Exception(f"Login Canal Pro: estado inesperado pós-submit. Evidências: {ultimo_snapshot}")
+
+            if validate_canal_pro_logged_in(driver):
+                print(f"✅ Login no Canal Pro realizado. URL: {driver.current_url}")
+                return aba_crm
+
+            ultimo_snapshot = save_debug_snapshot(driver, f"canal_pro_validacao_pos_login_falhou_tentativa_{tentativa}")
+            raise Exception(f"Login Canal Pro: validação pós-login falhou. Evidências: {ultimo_snapshot}")
+
+        except Exception as exc:
+            ultimo_erro = exc
+            print(f"⚠️ Tentativa {tentativa}/3 de login Canal Pro falhou: {type(exc).__name__} | {exc}")
+            if tentativa < 3:
+                try:
+                    driver.delete_all_cookies()
+                except Exception:
+                    pass
+                time.sleep(3)
+
+    raise Exception(
+        "ERROR_CANAL_PRO_LOGIN: login do Canal Pro falhou após 3 tentativas. "
+        f"Último erro: {ultimo_erro}. Últimas evidências: {ultimo_snapshot}"
+    )
+
+
+def validate_canal_pro_logged_in(driver_ref):
     try:
-        # PASSO 3 — Localizar campo e-mail (Canal Pro usa type="text", não type="email")
-        print("📝 Localizando campo de e-mail...")
-        email_field = None
-        for locator in [
-            (By.CSS_SELECTOR, "input[name='email']"),
-            (By.XPATH, "//input[@placeholder='Digite seu e-mail']"),
-            (By.CSS_SELECTOR, "input.l-input__item[type='text']"),
-        ]:
-            try:
-                email_field = WebDriverWait(driver, 15).until(
-                    EC.presence_of_element_located(locator)
-                )
-                break
-            except Exception:
-                pass
-        if not email_field:
-            raise Exception("Campo de e-mail não encontrado na página de login do Canal Pro.")
-
-        # PASSO 4 — Localizar campo senha (Canal Pro usa type="text", não type="password")
-        print("📝 Localizando campo de senha...")
-        senha_field = None
-        for locator in [
-            (By.CSS_SELECTOR, "input[name='password']"),
-            (By.XPATH, "//input[contains(@placeholder, 'Digite sua senha')]"),
-        ]:
-            try:
-                senha_field = driver.find_element(*locator)
-                break
-            except Exception:
-                pass
-        if not senha_field:
-            raise Exception("Campo de senha não encontrado na página de login do Canal Pro.")
-
-        # PASSO 5 — Preencher campos com fallback JS e validação
-        print(f"📝 Preenchendo e-mail: {CANALPRO_EMAIL}")
-        _preencher_campo(email_field, CANALPRO_EMAIL, "email")
-
-        print("📝 Preenchendo senha: [oculta]")
-        _preencher_campo(senha_field, CANALPRO_SENHA, "senha")
-
-        # PASSO 6 — Clicar em "Entrar"
-        print("🖱️ Clicando em 'Entrar'...")
-        btn_entrar = None
-        for locator in [
-            (By.XPATH, "//button[normalize-space(text())='Entrar']"),
-            (By.CSS_SELECTOR, "button[type='submit']"),
-        ]:
-            try:
-                btn_entrar = driver.find_element(*locator)
-                break
-            except Exception:
-                pass
-
-        if btn_entrar:
-            try:
-                safe_click(btn_entrar)
-            except Exception:
-                driver.execute_script("arguments[0].click();", btn_entrar)
-        else:
-            senha_field.send_keys(Keys.RETURN)
-
-        # PASSO 7 — Detectar redirecionamento ou tela de 2FA
-        print("⏳ Aguardando resposta pós-login...")
-        status = _canal_pro_aguardar_pos_login()
-
-        if status == "2fa":
-            print("🔐 Detectada tela de 2FA (verificação em duas etapas).")
-            _canal_pro_handle_2fa()
-        elif status == "ok":
-            pass  # login direto, sem 2FA
-        else:
-            raise Exception("Login Canal Pro: timeout ou estado inesperado pós-submit.")
-
-        # Confirmação final
-        current = driver.current_url
-        if "/login" in current:
-            raise Exception(f"Login no Canal Pro falhou — URL ainda em /login. URL atual: {current}")
-
-        time.sleep(2)
-        _canal_pro_handle_cookie_popup()
-        print(f"✅ Login no Canal Pro realizado. URL: {driver.current_url}")
-        return aba_crm
-
-    except Exception as exc:
-        print(f"⛔ Falha no login do Canal Pro: {type(exc).__name__} | {repr(exc)}")
-        raise
+        url = (driver_ref.current_url or "").lower()
+        if "canalpro.grupozap.com" not in url and "canal-pro.grupozap.com" not in url:
+            return False
+        login_inputs = _visible_enabled(driver_ref.find_elements(
+            By.CSS_SELECTOR,
+            "input[type='password'], input[name='email'], input[autocomplete='email']"
+        ))
+        if login_inputs and "login" in url:
+            return False
+        _canal_pro_navigate_to_listings()
+        WebDriverWait(driver_ref, 20).until(
+            lambda d: "/listings" in (d.current_url or "").lower()
+            or len(d.find_elements(By.CSS_SELECTOR, "span.card-content__tag")) > 0
+            or _canal_pro_lista_vazia_confirmada()[0]
+            or bool(_canal_pro_obter_contador_oficial_texto())
+        )
+        return True
+    except Exception:
+        save_debug_snapshot(driver_ref, "canal_pro_validate_logged_in_falhou")
+        return False
 
 
 def _canal_pro_aguardar_pos_login():
@@ -1725,7 +2011,8 @@ def _canal_pro_clicar_verificar_codigo():
             return
         except Exception:
             continue
-    raise Exception("2FA: não foi possível clicar em 'Verificar código' ou aguardar redirecionamento.")
+    snap = save_debug_snapshot(driver, "canal_pro_2fa_verificar_codigo_falhou")
+    raise Exception(f"2FA: não foi possível clicar em 'Verificar código' ou aguardar redirecionamento. Evidências: {snap}")
 
 
 def _canal_pro_preencher_codigo_2fa(codigo):
@@ -1764,7 +2051,8 @@ def _canal_pro_preencher_codigo_2fa(codigo):
         html = driver.execute_script("return document.body.innerHTML.slice(0, 5000);")
         print("⚠️ Campos do código 2FA não encontrados. HTML parcial:")
         print(html[:2000])
-        raise Exception("2FA: campos de código não encontrados.")
+        snap = save_debug_snapshot(driver, "canal_pro_2fa_campos_nao_encontrados")
+        raise Exception(f"2FA: campos de código não encontrados. Evidências: {snap}")
 
     # Tenta auto-tab (envia código completo no primeiro campo)
     try:
@@ -2149,6 +2437,24 @@ def _avaliar_resultado_intermediario(codigos_alvo, resultado_varredura, ultimo_t
 
 def _deve_abortar_por_erros_consecutivos(erros_consecutivos, max_erros=MAX_ERROS_CONSECUTIVOS_SCRAPING):
     return erros_consecutivos >= max_erros
+
+
+def _test_canal_pro_login_flow():
+    print("🧪 TESTE SEGURO: login Canal Pro + Anúncios, sem alterar imóveis.")
+    aba_origem = _canal_pro_login()
+    _canal_pro_navigate_to_listings()
+    resultado = coletar_codigos_pagina_com_retry(driver, pagina_atual=1, max_tentativas=3)
+    snap = save_debug_snapshot(driver, "canal_pro_login_test_success")
+    codigos = sorted(resultado.get("codigos") or [])
+    print(f"✅ Teste Canal Pro concluído. Página 1: {len(codigos)} código(s): {codigos}")
+    print(f"🧪 Snapshot de sucesso: {snap}")
+    try:
+        if len(driver.window_handles) > 1:
+            driver.close()
+            driver.switch_to.window(aba_origem)
+    except Exception:
+        pass
+    return True
 
 
 def _selftest_parte_intermediaria():
@@ -2882,6 +3188,12 @@ def main():
     options.add_argument("--disable-notifications")
     options.add_argument("--disable-popup-blocking")
     options.add_argument("--disable-gpu")
+    options.add_argument("--lang=pt-BR")
+    options.add_argument(
+        "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/147.0.0.0 Safari/537.36"
+    )
 
     usando_headless = em_nuvem or MODO_HEADLESS
 
@@ -2934,6 +3246,12 @@ def main():
     driver = _iniciar_chrome_com_retry(options, usando_headless)
     wait = WebDriverWait(driver, 30)
     actions = ActionChains(driver)
+    try:
+        driver.set_window_size(1920, 1080)
+        ua = driver.execute_script("return navigator.userAgent")
+        print(f"🖥️ Headless ativo: {usando_headless} | janela={driver.get_window_size()} | user-agent={ua}")
+    except Exception as exc:
+        print(f"⚠️ Não consegui registrar window/user-agent: {exc}")
 
     if DRY_RUN:
         print("🔍 DRY_RUN ATIVO — nenhuma alteração será feita no CRM.")
@@ -2942,6 +3260,12 @@ def main():
         # ── PRÉ-EXECUÇÃO: valida diretório de logs/checkpoints ────────────────
         os.makedirs(CHECKPOINT_DIR, exist_ok=True)
         os.makedirs("logs", exist_ok=True)
+
+        if TEST_CANAL_PRO_LOGIN_ONLY:
+            _test_canal_pro_login_flow()
+            status_final = "CANAL_PRO_LOGIN_TEST_OK"
+            _run_state_salvar(status=status_final, imoveis=[])
+            return
 
         # --- LOGIN CRM ---
         driver.get(CRM_URL)

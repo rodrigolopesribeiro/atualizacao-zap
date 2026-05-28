@@ -1,8 +1,8 @@
 ﻿[Unit]
-Description=Timer diario Atualizacao ZAP as 23:00
+Description=Timer diario Atualizacao ZAP as 20:00
 
 [Timer]
-OnCalendar=*-*-* 23:00:00
+OnCalendar=*-*-* 20:00:00
 Persistent=true
 Unit=atualizacao-zap.service
 
