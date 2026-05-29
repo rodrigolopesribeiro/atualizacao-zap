@@ -1,4 +1,5 @@
 import base64
+import imaplib
 import json
 import os
 import platform
@@ -7,7 +8,11 @@ import shutil
 import subprocess
 import sys
 import traceback
+import unicodedata
 from datetime import datetime, timedelta
+from email import policy
+from email.parser import BytesParser
+from email.utils import parsedate_to_datetime
 import time
 
 from google.auth.transport.requests import Request
@@ -1269,6 +1274,147 @@ def _extrair_corpo_email(msg):
     return "\n".join(textos) or msg.get("snippet", "")
 
 
+def _normalizar_busca_email(texto):
+    texto = texto or ""
+    texto = unicodedata.normalize("NFKD", str(texto))
+    texto = "".join(ch for ch in texto if not unicodedata.combining(ch))
+    return texto.lower()
+
+
+def _extrair_codigo_2fa_confiavel(from_h, subject_h, corpo):
+    """Valida se o e-mail parece ser 2FA do Canal Pro e extrai um codigo de 6 digitos."""
+    from_l = _normalizar_busca_email(from_h)
+    subject_l = _normalizar_busca_email(subject_h)
+    corpo_l = _normalizar_busca_email(corpo)
+
+    blacklist_from = [
+        "novidades.zapimoveis.com.br",
+        "news@",
+        "newsletter",
+        "marketing",
+        "noreply@mail.",
+        "noreply@email.",
+        "ofertas@",
+        "promocao@",
+        "comunicacao@",
+    ]
+    whitelist_from = [
+        "grupozap", "canalpro", "canal-pro", "olx.com.br",
+        "zapimoveis.com.br", "vivareal.com", "olx.com",
+    ]
+    assuntos_auth = [
+        "confirmacao", "codigo de confirmacao", "verificacao",
+        "acesso", "autenticacao", "codigo para", "uso unico",
+        "canal pro", "grupo olx", "novo dispositivo",
+    ]
+    corpo_auth = [
+        "confirmar", "uso unico", "novo dispositivo",
+        "canal pro", "codigo", "verificar",
+    ]
+    promo_keywords = [
+        "chegou o imovel", "perfeito pra voce", "oferta", "promocao",
+        "desconto", "novidade", "imovel perfeito",
+    ]
+
+    if any(b in from_l for b in blacklist_from):
+        return None, f"remetente bloqueado: {from_h[:60]}"
+    if any(p in subject_l for p in promo_keywords):
+        return None, f"assunto promocional: {subject_h[:60]}"
+
+    assunto_ok = any(a in subject_l for a in assuntos_auth)
+    from_ok = any(w in from_l for w in whitelist_from)
+    corpo_ok = any(c in corpo_l for c in corpo_auth)
+    if not (assunto_ok or from_ok) or not corpo_ok:
+        return None, f"nao parece e-mail de autenticacao (assunto={subject_h[:40]}, from={from_h[:40]})"
+
+    padroes = [
+        r"confirmar[:\s]+(\d{6})",
+        r"codigo[:\s]*(\d{6})",
+        r"use o codigo[:\s]*(\d{6})",
+        r"\b(\d{6})\b",
+    ]
+    for padrao in padroes:
+        m = re.search(padrao, corpo_l, re.IGNORECASE)
+        if m:
+            return m.group(1), "ok"
+
+    return None, "e-mail de autenticacao sem codigo de 6 digitos"
+
+
+def _extrair_corpo_email_imap(msg):
+    textos = []
+    partes = msg.walk() if msg.is_multipart() else [msg]
+    for parte in partes:
+        content_type = parte.get_content_type()
+        if content_type not in ("text/plain", "text/html"):
+            continue
+        try:
+            textos.append(parte.get_content())
+        except Exception:
+            payload = parte.get_payload(decode=True) or b""
+            charset = parte.get_content_charset() or "utf-8"
+            textos.append(payload.decode(charset, errors="ignore"))
+    return "\n".join(textos)
+
+
+def _gmail_buscar_codigo_2fa_imap(janela_segundos=300, timestamp_inicio=None):
+    """
+    Fallback sem OAuth para quando gmail_token.json expira/revoga.
+    Requer GMAIL_APP_PASSWORD no .env da VPS.
+    """
+    usuario = os.getenv("GMAIL_IMAP_EMAIL") or os.getenv("GMAIL_EMAIL") or CANALPRO_EMAIL
+    senha_app = os.getenv("GMAIL_APP_PASSWORD") or os.getenv("GMAIL_IMAP_PASSWORD")
+    if not senha_app:
+        print("   ⚠️ Fallback IMAP indisponível: GMAIL_APP_PASSWORD não configurado.")
+        return None
+
+    ts_corte = timestamp_inicio or (datetime.now() - timedelta(seconds=janela_segundos))
+    since_date = (ts_corte - timedelta(days=1)).strftime("%d-%b-%Y")
+
+    try:
+        print("   📧 Tentando fallback Gmail IMAP para buscar código 2FA...")
+        with imaplib.IMAP4_SSL("imap.gmail.com", 993) as mail:
+            mail.login(usuario, senha_app)
+            mail.select("INBOX")
+            status, data = mail.search(None, f'(SINCE "{since_date}")')
+            if status != "OK" or not data or not data[0]:
+                print("   📭 IMAP: nenhum e-mail recente encontrado.")
+                return None
+
+            ids = data[0].split()[-40:]
+            for msg_id in reversed(ids):
+                status, fetched = mail.fetch(msg_id, "(RFC822)")
+                if status != "OK" or not fetched:
+                    continue
+                raw = fetched[0][1]
+                msg = BytesParser(policy=policy.default).parsebytes(raw)
+
+                data_email = msg.get("Date")
+                try:
+                    dt_email = parsedate_to_datetime(data_email)
+                    if dt_email and dt_email.timestamp() < ts_corte.timestamp():
+                        continue
+                    data_str = dt_email.astimezone().strftime("%H:%M:%S") if dt_email else "?"
+                except Exception:
+                    data_str = "?"
+
+                from_h = msg.get("From", "")
+                subject_h = msg.get("Subject", "")
+                corpo = _extrair_corpo_email_imap(msg)
+                print(f"   📧 IMAP candidato: {data_str} | de='{from_h[:50]}' | assunto='{subject_h[:50]}'")
+
+                codigo, motivo = _extrair_codigo_2fa_confiavel(from_h, subject_h, corpo)
+                if codigo:
+                    print("   ✅ Código 2FA encontrado via IMAP.")
+                    return codigo
+                print(f"   ❌ IMAP rejeitado: {motivo}")
+
+    except Exception as exc:
+        print(f"   ⚠️ Fallback IMAP falhou: {type(exc).__name__} | {repr(exc)}")
+
+    return None
+
+
 def _gmail_buscar_codigo_2fa(service, janela_segundos=300, timestamp_inicio=None):
     """
     Busca o código 2FA do Canal Pro com filtros fortes:
@@ -2103,11 +2249,15 @@ def _canal_pro_handle_2fa():
     timestamp_inicio = datetime.now() - timedelta(minutes=3)
 
     print("📧 Autenticando Gmail API...")
+    gmail_service = None
+    erro_gmail_api = None
     try:
         gmail_service = _gmail_autenticar()
         print("✅ Gmail API autenticado.")
     except Exception as exc:
-        raise Exception(f"Falha ao autenticar Gmail API: {repr(exc)}")
+        erro_gmail_api = exc
+        print(f"⚠️ Gmail API indisponível: {repr(exc)}")
+        print("   Vou tentar o fallback IMAP com GMAIL_APP_PASSWORD.")
 
     TIMEOUT_SEGUNDOS   = 180
     INTERVALO_SEGUNDOS = 10
@@ -2120,11 +2270,18 @@ def _canal_pro_handle_2fa():
         print(f"   🔍 Tentativa #{tentativa} — buscando código 2FA... ({restante}s restantes)")
 
         janela = int(time.time() - inicio) + 30
-        codigo = _gmail_buscar_codigo_2fa(
-            gmail_service,
-            janela_segundos=max(janela, 60),
-            timestamp_inicio=timestamp_inicio,
-        )
+        codigo = None
+        if gmail_service:
+            codigo = _gmail_buscar_codigo_2fa(
+                gmail_service,
+                janela_segundos=max(janela, 60),
+                timestamp_inicio=timestamp_inicio,
+            )
+        if not codigo:
+            codigo = _gmail_buscar_codigo_2fa_imap(
+                janela_segundos=max(janela, 60),
+                timestamp_inicio=timestamp_inicio,
+            )
 
         if codigo and len(codigo) == 6 and codigo.isdigit():
             print(f"✅ Código 2FA obtido automaticamente: {codigo}")
@@ -2133,7 +2290,8 @@ def _canal_pro_handle_2fa():
 
         time.sleep(INTERVALO_SEGUNDOS)
 
-    raise Exception("ERROR_2FA: código não encontrado no Gmail após 180s")
+    detalhe_api = f" Gmail API falhou antes: {repr(erro_gmail_api)}" if erro_gmail_api else ""
+    raise Exception(f"ERROR_2FA: código não encontrado no Gmail após 180s.{detalhe_api}")
 
 
 def _canal_pro_navigate_to_listings():
