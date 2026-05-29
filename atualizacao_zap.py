@@ -2407,6 +2407,7 @@ def coletar_codigos_pagina_com_retry(driver_ref, pagina_atual, max_tentativas=3)
         try:
             WebDriverWait(driver_ref, 12).until(
                 lambda d: len(d.find_elements(By.CSS_SELECTOR, "span.card-content__tag")) > 0
+                or "Criado em" in d.page_source
                 or _canal_pro_lista_vazia_confirmada()[0]
             )
         except Exception:
@@ -2421,6 +2422,18 @@ def coletar_codigos_pagina_com_retry(driver_ref, pagina_atual, max_tentativas=3)
                     codigos.add(texto)
             except Exception:
                 pass
+
+        if not codigos:
+            html = driver_ref.page_source or ""
+            padroes_html = [
+                # Layout novo do Canal Pro em /anuncios: tag numerica antes do preco e datas.
+                r"<span>\s*(\d{2,6})\s*</span>\s*</div>\s*</div>\s*</header>\s*<div[^>]*>\s*<h3[^>]*>\s*R\$",
+                # Fallback mais tolerante: codigo numerico pequeno dentro de um card que contem "Criado em".
+                r"<span>\s*(\d{2,6})\s*</span>.{0,900}?Criado em",
+            ]
+            for padrao in padroes_html:
+                for codigo in re.findall(padrao, html, flags=re.IGNORECASE | re.DOTALL):
+                    codigos.add(str(codigo).strip())
 
         if codigos:
             return {
