@@ -1367,6 +1367,7 @@ def _gmail_buscar_codigo_2fa_imap(janela_segundos=300, timestamp_inicio=None):
     if not senha_app:
         print("   ⚠️ Fallback IMAP indisponível: GMAIL_APP_PASSWORD não configurado.")
         return None
+    senha_app = re.sub(r"\s+", "", senha_app.strip())
 
     ts_corte = timestamp_inicio or (datetime.now() - timedelta(seconds=janela_segundos))
     since_date = (ts_corte - timedelta(days=1)).strftime("%d-%b-%Y")
