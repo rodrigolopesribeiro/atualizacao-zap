@@ -37,13 +37,28 @@ from webdriver_manager.chrome import ChromeDriverManager
 
 load_dotenv()
 
+
+def _arg_value(name, default=None):
+    try:
+        idx = sys.argv.index(name)
+        return sys.argv[idx + 1]
+    except (ValueError, IndexError):
+        return default
+
+
 # === CONFIGURACOES CRM ===
 USUARIO = os.environ["CRM_USUARIO"]
 SENHA = os.environ["CRM_SENHA"]
 CRM_URL = "https://www.rioorla.com.br/crm/p.php"
 HOJE = datetime.now().strftime("%d/%m/%Y")
 TEXTO_ATUALIZACAO = f"<p>Atualizado em {HOJE}.</p>"
-VIVAREAL_VALUE = "9"
+
+# === CONFIGURACAO DO PORTAL-ALVO ===
+PORTAL_TARGET_ID = os.getenv("PORTAL_TARGET_ID", "").strip()
+PORTAL_TARGET_NAME = os.getenv("PORTAL_TARGET_NAME", "").strip()
+PORTAL_TARGET_FILE = os.getenv("PORTAL_TARGET_FILE", "").strip()
+PORTAL_VERIFY_TARGET = os.getenv("PORTAL_VERIFY_TARGET", "canal_pro").strip()
+VIVAREAL_VALUE = "9"  # compatibilidade com checkpoints antigos
 
 # === CONFIGURACOES CANAL PRO ===
 CANALPRO_EMAIL = os.environ["CANALPRO_EMAIL"]
@@ -110,12 +125,58 @@ actions = None
 HEALTHCHECK_ONLY = "--healthcheck" in sys.argv
 TEST_CANAL_PRO_LOGIN_ONLY = "--test-canal-pro-login" in sys.argv
 AUDIT_PORTAL_UPDATE_ONLY = "--audit-portal-update" in sys.argv
+AUDIT_PROPERTY_PORTAL_ONLY = "--audit-property-portal" in sys.argv
 AUDIT_CLICK_UPDATE = "--audit-click-update" in sys.argv or os.getenv("AUDIT_CLICK_UPDATE", "false").lower() == "true"
+ARG_CODIGO = _arg_value("--codigo")
+ARG_PORTAL_ID = _arg_value("--portal-id")
 
 
 # =============================================================================
 # UTILITÁRIOS GERAIS
 # =============================================================================
+
+def require_portal_target_config():
+    missing = []
+    if not PORTAL_TARGET_ID:
+        missing.append("PORTAL_TARGET_ID")
+    if not PORTAL_TARGET_NAME:
+        missing.append("PORTAL_TARGET_NAME")
+    if not PORTAL_TARGET_FILE:
+        missing.append("PORTAL_TARGET_FILE")
+    if missing:
+        raise Exception(
+            "PORTAL_TARGET_ID nao configurado. Defina 9 para VivaReal ou 61 para OLX Brasil. "
+            f"Variaveis ausentes: {', '.join(missing)}"
+        )
+    return {
+        "id": PORTAL_TARGET_ID,
+        "name": PORTAL_TARGET_NAME,
+        "file": PORTAL_TARGET_FILE,
+        "verify_target": PORTAL_VERIFY_TARGET,
+    }
+
+
+def portal_target_label(portal_id=None, portal_name=None, portal_file=None):
+    portal_id = str(portal_id or PORTAL_TARGET_ID or "?").strip()
+    portal_name = (portal_name or PORTAL_TARGET_NAME or "Portal nao configurado").strip()
+    portal_file = (portal_file or PORTAL_TARGET_FILE or "?").strip()
+    return f"{portal_name} (id={portal_id}, arquivo={portal_file})"
+
+
+def _portal_checkbox_css(portal_id=None):
+    portal_id = str(portal_id or PORTAL_TARGET_ID).strip()
+    return f"input[data-tipo='portaispagos'][data-portal-check='1'][value='{portal_id}']"
+
+
+def _xpath_literal(value):
+    value = str(value)
+    if "'" not in value:
+        return f"'{value}'"
+    if '"' not in value:
+        return f'"{value}"'
+    parts = value.split("'")
+    return "concat(" + ", \"'\", ".join(f"'{part}'" for part in parts) + ")"
+
 
 def safe_click(elem):
     driver.execute_script("arguments[0].scrollIntoView({block:'center'});", elem)
@@ -383,7 +444,10 @@ def swap_7th_with_8th_photo():
     print("📸 Oitava foto movida para a posição da sétima (fallback drag-and-drop).")
 
 
-def open_divulgacao_tab():
+def open_divulgacao_tab(portal_id=None):
+    if portal_id is None:
+        require_portal_target_config()
+        portal_id = PORTAL_TARGET_ID
     try:
         tab = wait.until(
             EC.element_to_be_clickable(
@@ -401,7 +465,7 @@ def open_divulgacao_tab():
             EC.presence_of_element_located(
                 (
                     By.CSS_SELECTOR,
-                    "input[data-tipo='portaispagos'][data-portal-check='1'][value='9']"
+                    _portal_checkbox_css(portal_id)
                 )
             )
         )
@@ -439,12 +503,15 @@ def open_gerais_tab():
         return False
 
 
-def get_vivareal_checkbox_parts():
+def get_target_portal_checkbox_parts(portal_id=None):
+    if portal_id is None:
+        require_portal_target_config()
+        portal_id = PORTAL_TARGET_ID
     input_el = wait.until(
         EC.presence_of_element_located(
             (
                 By.CSS_SELECTOR,
-                "input[data-tipo='portaispagos'][data-portal-check='1'][value='9']"
+                _portal_checkbox_css(portal_id)
             )
         )
     )
@@ -462,48 +529,61 @@ def get_vivareal_checkbox_parts():
     return input_el, wrapper, helper
 
 
-def is_vivareal_checked():
-    _, wrapper, _ = get_vivareal_checkbox_parts()
+def is_target_portal_checked(portal_id=None):
+    _, wrapper, _ = get_target_portal_checkbox_parts(portal_id)
     wrapper_class = wrapper.get_attribute("class") or ""
     return "checked" in wrapper_class
 
 
-def set_vivareal_checked(checked):
-    _, wrapper, helper = get_vivareal_checkbox_parts()
+def set_target_portal_checked(checked, portal_id=None, portal_name=None):
+    if portal_id is None:
+        require_portal_target_config()
+        portal_id = PORTAL_TARGET_ID
+    portal_name = portal_name or PORTAL_TARGET_NAME or f"portal {portal_id}"
+    _, wrapper, helper = get_target_portal_checkbox_parts(portal_id)
     atual = "checked" in ((wrapper.get_attribute("class") or ""))
-
     if atual == checked:
-        print(f"ℹ️ VivaReal já está {'marcado' if checked else 'desmarcado'}.")
+        print(f"INFO: {portal_name} ja esta {'marcado' if checked else 'desmarcado'}.")
         return
-
     safe_click(helper)
     time.sleep(0.8)
-
-    _, wrapper, helper = get_vivareal_checkbox_parts()
+    _, wrapper, helper = get_target_portal_checkbox_parts(portal_id)
     novo = "checked" in ((wrapper.get_attribute("class") or ""))
-
     if novo != checked:
         driver.execute_script("arguments[0].click();", helper)
         time.sleep(0.8)
-
-    _, wrapper, _ = get_vivareal_checkbox_parts()
+    _, wrapper, _ = get_target_portal_checkbox_parts(portal_id)
     final = "checked" in ((wrapper.get_attribute("class") or ""))
-
     if final != checked:
-        raise Exception(f"Falha ao alterar VivaReal para checked={checked}")
+        raise Exception(f"Falha ao alterar {portal_name} para checked={checked}")
+    print(f"{'OK' if checked else 'REMOVIDO'} {portal_name} {'marcado' if checked else 'desmarcado'}.")
 
-    print(f"{'✅' if checked else '🚫'} VivaReal {'marcado' if checked else 'desmarcado'}.")
+
+def get_vivareal_checkbox_parts():
+    return get_target_portal_checkbox_parts(VIVAREAL_VALUE)
+
+
+def is_vivareal_checked():
+    return is_target_portal_checked(VIVAREAL_VALUE)
+
+
+def set_vivareal_checked(checked):
+    return set_target_portal_checked(checked, VIVAREAL_VALUE, "VivaReal")
 
 
 def get_vivareal_category_label(value):
     return CATEGORIAS_VIVAREAL.get(str(value), "Simples")
 
 
-def get_vivareal_category_value():
+def get_target_portal_category_value(portal_id=None, portal_name=None):
+    if portal_id is None:
+        require_portal_target_config()
+        portal_id = PORTAL_TARGET_ID
+    portal_name = portal_name or PORTAL_TARGET_NAME or f"portal {portal_id}"
+    selector = f"#destaque{portal_id}"
     try:
-        select = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "#destaque9")))
+        select = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, selector)))
         value = driver.execute_script("return arguments[0].value;", select) or "0"
-
         label = driver.execute_script(
             """
             const sel = arguments[0];
@@ -512,19 +592,24 @@ def get_vivareal_category_value():
             """,
             select,
         ) or get_vivareal_category_label(value)
-
-        print(f"📌 Categoria VivaReal original: {label} ({value})")
+        print(f"Categoria {portal_name} original: {label} ({value})")
         return value, label
-
     except Exception as exc:
-        print(f"⚠️ Não consegui capturar categoria VivaReal. Usando Simples (0). Erro: {type(exc).__name__} | {repr(exc)}")
-        debug_modal_state("erro_get_categoria")
+        print(f"Aviso: nao consegui capturar categoria de {portal_name}. Usando Simples (0). Erro: {type(exc).__name__} | {repr(exc)}")
+        debug_modal_state("erro_get_categoria_portal")
         return "0", "Simples"
 
 
-def set_vivareal_category_value(value):
+def set_target_portal_category_value(value, portal_id=None, portal_name=None):
+    if portal_id is None:
+        require_portal_target_config()
+        portal_id = PORTAL_TARGET_ID
     normalized = str(value) if str(value) in CATEGORIAS_VIVAREAL else "0"
-    select = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "#destaque9")))
+    selector = f"#destaque{portal_id}"
+    try:
+        select = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, selector)))
+    except Exception:
+        return
     driver.execute_script(
         """
         const el = arguments[0];
@@ -536,6 +621,14 @@ def set_vivareal_category_value(value):
         select,
         normalized,
     )
+
+
+def get_vivareal_category_value():
+    return get_target_portal_category_value(VIVAREAL_VALUE, "VivaReal")
+
+
+def set_vivareal_category_value(value):
+    return set_target_portal_category_value(value, VIVAREAL_VALUE, "VivaReal")
 
 
 def get_property_code_from_modal():
@@ -591,6 +684,7 @@ def expand_menu_if_needed():
 
 
 def apply_initial_filters():
+    portal = require_portal_target_config()
     # Aguarda a página estabilizar
     time.sleep(2)
 
@@ -635,8 +729,9 @@ def apply_initial_filters():
     time.sleep(1)
 
     wait.until(EC.element_to_be_clickable((By.XPATH, "//select[@data-input='idportal']"))).click()
-    wait.until(EC.element_to_be_clickable((By.XPATH, "//select[@data-input='idportal']/option[@value='9']"))).click()
-    print("✅ Filtro 'Divulgação em Portais - VivaReal' aplicado.")
+    option_xpath = f"//select[@data-input='idportal']/option[@value={_xpath_literal(portal['id'])}]"
+    wait.until(EC.element_to_be_clickable((By.XPATH, option_xpath))).click()
+    print(f"✅ Filtro 'Divulgação em Portais - {portal['name']}' aplicado.")
     time.sleep(1)
 
     cap_tab = wait.until(
@@ -804,71 +899,68 @@ def edit_property_result_by_code(codigo):
     print(f"✏️ Modal correto aberto para código {codigo}.")
 
 
-def go_to_integracoes_parceiros_and_update_vivareal():
-    expand_menu_if_needed()
+def _normalize_portal_id(value):
+    return str(value or "").strip().strip('"').strip("'")
 
+
+def _parse_update_portais_from_onclick(onclick):
+    onclick = onclick or ""
+    match = re.search(r"updatePortais\((.*)\)", onclick)
+    if not match:
+        return []
+    payload = match.group(1).strip().rstrip(";")
     try:
-        a_integracoes = wait.until(
-            EC.element_to_be_clickable(
-                (
-                    By.XPATH,
-                    "//a[.//i[contains(@class,'fa-plug')] and contains(normalize-space(.),'Integrações')]",
-                )
-            )
-        )
+        data = json.loads(payload)
+    except Exception:
+        return []
+    if isinstance(data, dict):
+        data = [data]
+    return [{"descricao": str(i.get("descricao", "")), "arquivo": str(i.get("arquivo", "")), "id": _normalize_portal_id(i.get("id", ""))} for i in data if isinstance(i, dict)]
+
+
+def find_target_portal_update_button(portal_id=None, portal_name=None, portal_file=None):
+    if portal_id is None:
+        portal = require_portal_target_config()
+        portal_id, portal_name, portal_file = portal["id"], portal["name"], portal["file"]
+    portal_id = _normalize_portal_id(portal_id)
+    candidates = driver.find_elements(By.XPATH, "//a[contains(@onclick,'updatePortais') or contains(@class,'btn-update-portal')] | //button[contains(@onclick,'updatePortais')]")
+    for el in candidates:
+        for item in _parse_update_portais_from_onclick(_safe_attr(el, "onclick")):
+            if _normalize_portal_id(item.get("id")) == portal_id:
+                return el
+    raise Exception(f"Botao updatePortais nao encontrado para {portal_target_label(portal_id, portal_name, portal_file)}")
+
+
+def go_to_integracoes_parceiros_and_update_target_portal(portal_id=None, portal_name=None, portal_file=None):
+    if portal_id is None:
+        portal = require_portal_target_config()
+        portal_id, portal_name, portal_file = portal["id"], portal["name"], portal["file"]
+    label = portal_target_label(portal_id, portal_name, portal_file)
+    expand_menu_if_needed()
+    try:
+        a_integracoes = wait.until(EC.element_to_be_clickable((By.XPATH, "//a[.//i[contains(@class,'fa-plug')] and contains(normalize-space(.),'Integra')]")))
         safe_click(a_integracoes)
         time.sleep(1)
-        print("✅ Menu: Integrações clicado.")
-    except Exception as exc:
-        print(f"⚠️ Não consegui clicar em Integrações pelo menu: {type(exc).__name__} | {repr(exc)}")
-        try:
-            driver.get("https://www.rioorla.com.br/crm/po.php")
-            time.sleep(2)
-            print("✅ Fallback: aberto po.php diretamente.")
-        except Exception as exc_2:
-            print(f"⛔ Falha no fallback po.php: {type(exc_2).__name__} | {repr(exc_2)}")
-            return
-
+    except Exception:
+        driver.get("https://www.rioorla.com.br/crm/po.php")
+        time.sleep(2)
     try:
-        a_parceiros = wait.until(
-            EC.element_to_be_clickable(
-                (
-                    By.XPATH,
-                    "//a[contains(@href,'po.php') and .//i[contains(@class,'fa-handshake')] and contains(normalize-space(.),'Parceiros')]",
-                )
-            )
-        )
+        a_parceiros = wait.until(EC.element_to_be_clickable((By.XPATH, "//a[contains(@href,'po.php') and .//i[contains(@class,'fa-handshake')] and contains(normalize-space(.),'Parceiros')]")))
         safe_click(a_parceiros)
         time.sleep(2)
-        print("✅ Menu: Parceiros clicado (po.php).")
-    except Exception as exc:
-        print(f"⚠️ Não consegui clicar em Parceiros pelo menu: {type(exc).__name__} | {repr(exc)}")
-        try:
-            driver.get("https://www.rioorla.com.br/crm/po.php")
-            time.sleep(2)
-            print("✅ Fallback: aberto po.php diretamente.")
-        except Exception as exc_2:
-            print(f"⛔ Falha no fallback po.php: {type(exc_2).__name__} | {repr(exc_2)}")
-            return
+    except Exception:
+        driver.get("https://www.rioorla.com.br/crm/po.php")
+        time.sleep(2)
+    btn = wait.until(lambda _driver: find_target_portal_update_button(portal_id, portal_name, portal_file))
+    print(f"Atualizando portal alvo: {label}")
+    print(f"Botao encontrado: {_portal_button_summary(btn)}")
+    safe_click(btn)
+    print(f"Atualizacao do {label} disparada.")
+    time.sleep(5)
 
-    try:
-        btn_atualizar_vivareal = wait.until(
-            EC.element_to_be_clickable(
-                (
-                    By.XPATH,
-                    "//a[contains(@class,'btn-update-portal') "
-                    "and contains(@onclick,'updatePortais') "
-                    "and (contains(@onclick,'VivaReal') or contains(@onclick,'\"id\":\"9\"') "
-                    "or contains(@onclick,\"'id':'9'\") or contains(@onclick,'id&quot;:&quot;9'))]",
-                )
-            )
-        )
-        safe_click(btn_atualizar_vivareal)
-        print("🚀 Cliquei em Atualizar do VivaReal (id 9).")
-        time.sleep(5)
-        print("✅ Atualização do VivaReal disparada.")
-    except Exception as exc:
-        print(f"⛔ Não consegui clicar em Atualizar do VivaReal: {type(exc).__name__} | {repr(exc)}")
+
+def go_to_integracoes_parceiros_and_update_vivareal():
+    return go_to_integracoes_parceiros_and_update_target_portal(VIVAREAL_VALUE, "VivaReal", "vivareal.php")
 
 
 def _portal_button_summary(el):
@@ -931,113 +1023,102 @@ def _write_audit_json(out_dir, name, data):
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 
+def _portal_input_summary(el):
+    summary = _portal_button_summary(el)
+    try:
+        summary["raw_value"] = _safe_attr(el, "value")
+        summary["checked_js"] = bool(driver.execute_script("return !!arguments[0].checked;", el))
+        summary["nearby_text"] = driver.execute_script(
+            """
+            const el = arguments[0];
+            const parent = el.closest('label, .form-group, .row, .col-md-12, li, div') || el.parentElement;
+            return parent ? (parent.textContent || '').trim().replace(/\\s+/g, ' ').slice(0, 500) : '';
+            """,
+            el,
+        ) or ""
+    except Exception as exc:
+        summary["portal_input_error"] = f"{type(exc).__name__}: {exc}"
+    return summary
+
+
+def open_divulgacao_tab_any():
+    try:
+        tab = wait.until(EC.element_to_be_clickable((By.XPATH, "//li[@id='a-nav-divulgation-modal']/a | //a[.//i[contains(@class,'fa-bullhorn')] and contains(normalize-space(.),'Divulgação')]")))
+        safe_click(tab)
+        time.sleep(1.2)
+        wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "input[data-tipo='portaispagos'][data-portal-check='1']")))
+        return True
+    except Exception as exc:
+        print(f"ERRO: falha ao abrir Divulgacao para auditoria: {type(exc).__name__} | {repr(exc)}")
+        return False
+
+
+def _audit_property_portal(codigo=None):
+    require_portal_target_config()
+    codigo = str(codigo or "").strip()
+    if not codigo:
+        raise Exception("Use --audit-property-portal --codigo CODIGO.")
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_dir = os.path.join("debug", f"{ts}_audit_property_portal_{codigo}")
+    os.makedirs(out_dir, exist_ok=True)
+    report = {"timestamp": datetime.now().isoformat(), "codigo": codigo, "portal_target": require_portal_target_config(), "safe_mode": True}
+    try:
+        if not search_property_by_code_strict(codigo):
+            raise Exception(f"Nao consegui localizar o imovel {codigo}.")
+        edit_property_result_by_code(codigo)
+        if not open_divulgacao_tab_any():
+            raise Exception("Nao consegui abrir Divulgacao.")
+        inputs = driver.find_elements(By.CSS_SELECTOR, "input[data-tipo='portaispagos'][data-portal-check='1']")
+        report["portal_inputs"] = [_portal_input_summary(el) for el in inputs]
+        report["target_input"] = [i for i in report["portal_inputs"] if str(i.get("raw_value")) == str(PORTAL_TARGET_ID)]
+        report["target_exists"] = bool(report["target_input"])
+        report["target_checked"] = bool(report["target_input"] and report["target_input"][0].get("checked_js"))
+        report["snapshot"] = save_debug_snapshot(driver, f"audit_property_portal_{codigo}")
+        _write_audit_json(out_dir, "audit_property_portal.json", report)
+        print(f"Auditoria do imovel salva em: {out_dir}")
+        return out_dir
+    finally:
+        close_any_open_modal()
+        close_known_popup_modals()
+
+
 def _audit_portal_update():
-    """
-    Diagnóstico sem alteração de imóveis. O clique em Atualizar só ocorre com
-    --audit-click-update, porque esse botão dispara publicação real no CRM.
-    """
-    print("🔎 AUDITORIA PORTAL: modo seguro iniciado.")
+    require_portal_target_config()
+    audit_portal_id = _normalize_portal_id(ARG_PORTAL_ID or PORTAL_TARGET_ID)
+    print(f"AUDITORIA PORTAL: modo seguro. Portal={portal_target_label(audit_portal_id, PORTAL_TARGET_NAME, PORTAL_TARGET_FILE)}")
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_dir = os.path.join("debug", f"{ts}_audit_portal_update")
     os.makedirs(out_dir, exist_ok=True)
-    report = {
-        "timestamp": datetime.now().isoformat(),
-        "safe_mode": not AUDIT_CLICK_UPDATE,
-        "audit_click_update": AUDIT_CLICK_UPDATE,
-        "crm_url": CRM_URL,
-        "portal_id_in_code": "9",
-        "findings": [],
-    }
-
+    report = {"timestamp": datetime.now().isoformat(), "safe_mode": not AUDIT_CLICK_UPDATE, "portal_target": require_portal_target_config(), "audit_portal_id": audit_portal_id}
     try:
         driver.execute_cdp_cmd("Network.enable", {})
     except Exception as exc:
         report["network_enable_error"] = f"{type(exc).__name__}: {exc}"
-
-    try:
-        if go_to_imoveis_page_fresh():
-            apply_initial_filters()
-            buttons = driver.find_elements(By.XPATH, "//button[contains(@onclick,'mdImovelUpdate')]")
-            report["filtered_edit_buttons_count"] = len(buttons)
-            if buttons:
-                safe_click(buttons[0])
-                wait.until(EC.visibility_of_element_located((By.ID, "titulo-input")))
-                codigo = get_property_code_from_modal()
-                report["sample_property_code"] = codigo
-                if open_divulgacao_tab():
-                    portal_inputs = driver.find_elements(By.CSS_SELECTOR, "input[data-tipo='portaispagos'][data-portal-check='1']")
-                    report["modal_portal_inputs"] = [_portal_button_summary(el) for el in portal_inputs]
-                    try:
-                        report["vivareal_checked_now"] = is_vivareal_checked()
-                    except Exception as exc:
-                        report["vivareal_checked_error"] = f"{type(exc).__name__}: {exc}"
-                    report["modal_snapshot"] = save_debug_snapshot(driver, "audit_portal_modal_divulgacao")
-                close_any_open_modal()
-                close_known_popup_modals()
-        else:
-            report["findings"].append("Não foi possível abrir a tela de imóveis.")
-    except Exception as exc:
-        report["property_audit_error"] = f"{type(exc).__name__}: {repr(exc)}"
-        debug_modal_state("audit_portal_property_error")
-        close_any_open_modal()
-
     try:
         driver.get("https://www.rioorla.com.br/crm/po.php")
         time.sleep(3)
-        report["partners_url"] = driver.current_url
         report["partners_snapshot"] = save_debug_snapshot(driver, "audit_portal_partners")
-
-        all_clickables = driver.find_elements(By.CSS_SELECTOR, "a, button, input[type='button'], input[type='submit']")
-        report["all_clickables"] = [_portal_button_summary(el) for el in all_clickables]
-
-        keywords = ["zap", "canal", "olx", "grupo", "publica", "integra", "reprocess", "atualizar", "vivareal", "portal"]
-        related = []
-        for el in all_clickables:
+        buttons = driver.find_elements(By.XPATH, "//a[contains(@onclick,'updatePortais') or contains(@class,'btn-update-portal')] | //button[contains(@onclick,'updatePortais')]")
+        report["update_portais_buttons"] = []
+        for el in buttons:
             summary = _portal_button_summary(el)
-            haystack = " ".join(str(summary.get(k, "")) for k in ["text", "id", "class", "onclick", "outerHTML"]).lower()
-            if any(k in haystack for k in keywords):
-                related.append(summary)
-        report["related_clickables"] = related
-
-        id9 = [
-            item for item in related
-            if '"id":"9"' in (item.get("onclick") or "")
-            or "'id':'9'" in (item.get("onclick") or "")
-            or "id&quot;:&quot;9" in (item.get("outerHTML") or "")
-            or "vivareal" in (item.get("onclick") or "").lower()
-            or "vivareal" in (item.get("text") or "").lower()
-        ]
-        report["id9_or_vivareal_candidates"] = id9
-
+            summary["updatePortais"] = _parse_update_portais_from_onclick(summary.get("onclick") or "")
+            report["update_portais_buttons"].append(summary)
+        report["target_update_candidates"] = [b for b in report["update_portais_buttons"] if any(_normalize_portal_id(p.get("id")) == audit_portal_id for p in b.get("updatePortais", []))]
         if AUDIT_CLICK_UPDATE:
-            print("⚠️ AUDITORIA: --audit-click-update ativo. O clique pode disparar publicação real.")
-            before = _collect_browser_network_logs()
-            report["network_before_click"] = before
-            if id9:
-                xpath = (
-                    "//a[contains(@class,'btn-update-portal') and contains(@onclick,'updatePortais') "
-                    "and (contains(@onclick,'\"id\":\"9\"') or contains(@onclick,\"'id':'9'\") "
-                    "or contains(@onclick,'id&quot;:&quot;9') or contains(@onclick,'VivaReal'))]"
-                )
-                btn = wait.until(EC.element_to_be_clickable((By.XPATH, xpath)))
-                report["clicked_button"] = _portal_button_summary(btn)
-                safe_click(btn)
-                time.sleep(120)
-                report["network_after_click"] = _collect_browser_network_logs()
-                report["post_click_snapshot"] = save_debug_snapshot(driver, "audit_portal_after_update_click")
-            else:
-                report["click_skipped_reason"] = "Nenhum candidato id=9/VivaReal encontrado."
+            btn = find_target_portal_update_button(audit_portal_id, PORTAL_TARGET_NAME, PORTAL_TARGET_FILE)
+            report["clicked_button"] = _portal_button_summary(btn)
+            safe_click(btn)
+            time.sleep(120)
+            report["network_after_click"] = _collect_browser_network_logs()
         else:
-            report["click_skipped_reason"] = "Modo seguro: use --audit-click-update para clicar no botão de atualização."
-
+            report["click_skipped_reason"] = "Modo seguro: use --audit-click-update --portal-id ID para clicar."
     except Exception as exc:
         report["partners_audit_error"] = f"{type(exc).__name__}: {repr(exc)}"
         debug_modal_state("audit_portal_partners_error")
-
     report["network_logs_collected"] = _collect_browser_network_logs()
     _write_audit_json(out_dir, "audit_report.json", report)
-    print(f"✅ Auditoria salva em: {out_dir}")
-    print(f"   Relatório: {os.path.join(out_dir, 'audit_report.json')}")
+    print(f"Auditoria salva em: {out_dir}")
     return out_dir
 
 
@@ -1167,6 +1248,10 @@ def _checkpoint_registrar_desmarcado(codigo, categoria_value, categoria_nome):
             data = json.load(f)
         data["desmarcados"].append({
             "codigo": codigo,
+            "portal_id": PORTAL_TARGET_ID,
+            "portal_nome": PORTAL_TARGET_NAME,
+            "portal_arquivo": PORTAL_TARGET_FILE,
+            "categoria_portal": categoria_value,
             "categoria_vivareal": categoria_value,
             "categoria_nome": categoria_nome,
         })
@@ -1241,7 +1326,7 @@ def _gerar_arquivo_rollback_pendente(pendentes, timestamp_str):
     fname = os.path.join(CHECKPOINT_DIR, f"rollback_pendente_{timestamp_str}.json")
     data = {
         "gerado_em": datetime.now().isoformat(),
-        "instrucao": "Remarcar manualmente o VivaReal para os imóveis abaixo no CRM.",
+        "instrucao": f"Remarcar manualmente o {portal_target_label()} para os imoveis abaixo no CRM.",
         "pendentes": pendentes,
     }
     with open(fname, "w", encoding="utf-8") as f:
@@ -1330,22 +1415,26 @@ def process_part_1_collect_and_disable_vivareal():
                 if not open_divulgacao_tab():
                     raise Exception("Não abriu Divulgação")
 
-                categoria_value, categoria_nome = get_vivareal_category_value()
+                categoria_value, categoria_nome = get_target_portal_category_value()
 
-                # Skip se VivaReal já está desmarcado — não reprocessar
-                if not is_vivareal_checked():
-                    print(f"ℹ️ Imóvel {codigo} já está desmarcado no VivaReal. Pulando sem salvar.")
+                # Skip se o portal alvo ja esta desmarcado - nao reprocessar
+                if not is_target_portal_checked():
+                    print(f"INFO: Imovel {codigo} ja esta desmarcado em {portal_target_label()}. Pulando sem salvar.")
                     codigos_ja_processados.add(codigo)
                     close_any_open_modal()
                     close_known_popup_modals()
                     time.sleep(1.5)
                     continue
 
-                set_vivareal_checked(False)
+                set_target_portal_checked(False)
 
                 if codigo not in {i["codigo"] for i in imoveis_processados}:
                     imoveis_processados.append({
                         "codigo": codigo,
+                        "portal_id": PORTAL_TARGET_ID,
+                        "portal_nome": PORTAL_TARGET_NAME,
+                        "portal_arquivo": PORTAL_TARGET_FILE,
+                        "categoria_portal": categoria_value,
                         "categoria_vivareal": categoria_value,
                         "categoria_nome": categoria_nome,
                     })
@@ -2801,6 +2890,32 @@ def _test_canal_pro_login_flow():
     return True
 
 
+def _prevalidate_target_portal_before_mutation():
+    portal = require_portal_target_config()
+    print(f"PREVALIDACAO: portal alvo = {portal_target_label()}")
+    if not go_to_imoveis_page_fresh():
+        raise Exception("Prevalidacao falhou: nao abriu tela de imoveis.")
+    apply_initial_filters()
+    botoes = driver.find_elements(By.XPATH, "//button[contains(@onclick,'mdImovelUpdate')]")
+    print(f"PREVALIDACAO: filtro do portal alvo retornou {len(botoes)} botao(oes) editar.")
+    if botoes:
+        safe_click(botoes[0])
+        wait.until(EC.visibility_of_element_located((By.ID, "titulo-input")))
+        codigo = get_property_code_from_modal()
+        if not open_divulgacao_tab(portal["id"]):
+            raise Exception(f"Prevalidacao falhou: portal alvo {portal_target_label()} nao existe na aba Divulgacao.")
+        checked = is_target_portal_checked(portal["id"])
+        print(f"PREVALIDACAO: imovel amostra={codigo} portal marcado={checked}")
+        close_any_open_modal()
+        close_known_popup_modals()
+    driver.get("https://www.rioorla.com.br/crm/po.php")
+    time.sleep(2)
+    btn = find_target_portal_update_button(portal["id"], portal["name"], portal["file"])
+    print(f"PREVALIDACAO: botao updatePortais encontrado: {_portal_button_summary(btn)}")
+    if os.getenv("VALIDAR_CANAL_PRO_PRE_MUTATION", "true").lower() in ("1", "true", "yes"):
+        _test_canal_pro_login_flow()
+
+
 def _selftest_parte_intermediaria():
     alvo = {"1018", "1146"}
 
@@ -3012,7 +3127,7 @@ def verify_properties_removed_from_zap(imoveis_processados):
 
 def _process_single_item_parte2(item):
     codigo = (item.get("codigo") or "").strip()
-    categoria_value = str(item.get("categoria_vivareal", "0")).strip() or "0"
+    categoria_value = str(item.get("categoria_portal", item.get("categoria_vivareal", "0"))).strip() or "0"
     categoria_nome = item.get("categoria_nome") or get_vivareal_category_label(categoria_value)
 
     if categoria_value not in CATEGORIAS_VIVAREAL:
@@ -3033,10 +3148,10 @@ def _process_single_item_parte2(item):
     if not open_divulgacao_tab():
         raise Exception("Não consegui abrir Divulgação dentro do imóvel correto.")
 
-    set_vivareal_checked(True)
-    set_vivareal_category_value(categoria_value)
+    set_target_portal_checked(True)
+    set_target_portal_category_value(categoria_value)
     save_property()
-    print(f"💾 Parte 2 concluída para {codigo}: VivaReal marcado como {categoria_nome} ({categoria_value}).")
+    print(f"Parte 2 concluida para {codigo}: {portal_target_label()} marcado como {categoria_nome} ({categoria_value}).")
     close_any_open_modal()
     return True
 
@@ -3083,9 +3198,9 @@ def process_part_2_restore_vivareal(imoveis_processados):
                 falhas_parte2.append(item)
 
     if falhas_parte2:
-        print("⛔ ATENÇÃO: os seguintes imóveis não foram restaurados no VivaReal:")
+        print(f"ATENCAO: os seguintes imoveis nao foram restaurados em {portal_target_label()}:")
         for item in falhas_parte2:
-            print(f"- Código {item['codigo']} | Categoria {item['categoria_nome']} ({item['categoria_vivareal']})")
+            print(f"- Codigo {item['codigo']} | Categoria {item['categoria_nome']} ({item.get('categoria_portal', item.get('categoria_vivareal'))})")
 
     return restaurados_parte2, falhas_parte2
 
@@ -3161,9 +3276,9 @@ def _tentar_rollback_se_necessario(imoveis_processados, ts_str):
         arquivo = _gerar_arquivo_rollback_pendente(pendentes, ts_str)
         print(f"\n🚨 ROLLBACK PARCIAL — {len(pendentes)} imóvel(is) NÃO revertidos!")
         print(f"   Arquivo de pendência: {arquivo}")
-        print("   ⚠️  AÇÃO MANUAL NECESSÁRIA: remarcar VivaReal para os códigos abaixo:")
+        print(f"   ACAO MANUAL NECESSARIA: remarcar {portal_target_label()} para os codigos abaixo:")
         for item in pendentes:
-            print(f"      → {item['codigo']} | {item.get('categoria_nome','?')} ({item.get('categoria_vivareal','?')})")
+            print(f"      -> {item['codigo']} | {item.get('categoria_nome','?')} ({item.get('categoria_portal', item.get('categoria_vivareal','?'))})")
         _checkpoint_fechar("ERROR_AFTER_MUTATION_ROLLBACK_PENDING")
     else:
         print(f"✅ Rollback concluído: {len(revertidos)} imóvel(is) restaurados.")
@@ -3357,11 +3472,16 @@ def _healthcheck_completo():
         ("CRM_SENHA", os.getenv("CRM_SENHA")),
         ("CANALPRO_EMAIL", os.getenv("CANALPRO_EMAIL")),
         ("CANALPRO_SENHA", os.getenv("CANALPRO_SENHA")),
+        ("PORTAL_TARGET_ID", os.getenv("PORTAL_TARGET_ID")),
+        ("PORTAL_TARGET_NAME", os.getenv("PORTAL_TARGET_NAME")),
+        ("PORTAL_TARGET_FILE", os.getenv("PORTAL_TARGET_FILE")),
     ]
     faltantes = [k for k, v in checks if not v]
     if faltantes:
         print(f"⛔ Variáveis ausentes: {faltantes}")
         return False
+
+    print(f"Portal alvo configurado: {portal_target_label()}")
 
     try:
         os.makedirs(CHECKPOINT_DIR, exist_ok=True)
@@ -3627,6 +3747,13 @@ def main():
             print(f"🔎 Auditoria concluída sem executar Parte 1/Parte 2: {audit_dir}")
             return
 
+        if AUDIT_PROPERTY_PORTAL_ONLY:
+            audit_dir = _audit_property_portal(ARG_CODIGO)
+            status_final = "AUDIT_PROPERTY_PORTAL_OK"
+            _run_state_salvar(status=status_final, imoveis=[])
+            print(f"Auditoria concluida sem executar Parte 1/Parte 2: {audit_dir}")
+            return
+
         if MODO_PULAR_PARTE_1:
             # =====================================================================
             # MODO TESTE: pula Parte 1, retoma da Parte Intermediária
@@ -3664,6 +3791,12 @@ def main():
                 status_final = "ERROR_BEFORE_MUTATION"
                 raise Exception("Não foi possível abrir Imóveis para iniciar a Parte 1.")
 
+            _prevalidate_target_portal_before_mutation()
+
+            if not go_to_imoveis_page_fresh():
+                status_final = "ERROR_BEFORE_MUTATION"
+                raise Exception("Não foi possível reabrir Imóveis após a pré-validação.")
+
             apply_initial_filters()
 
             # ── GUARDA DE 0 IMÓVEIS ──────────────────────────────────────────
@@ -3692,7 +3825,7 @@ def main():
             # ── CRIA CHECKPOINT ANTES DE QUALQUER ALTERAÇÃO ──────────────────
             _checkpoint_criar(ts_str)
 
-            print("\n🚧 ===== PARTE 1: desmarcando VivaReal =====")
+            print(f"\n🚧 ===== PARTE 1: desmarcando {portal_target_label()} =====")
             imoveis_processados = process_part_1_collect_and_disable_vivareal()
             print(f"📦 Total de imóveis salvos para a Parte 2: {len(imoveis_processados)}")
             print(f"🧾 ETAPA 1 ({run_id}) códigos desmarcados: {[str(i.get('codigo','')).strip() for i in imoveis_processados]}")
@@ -3711,8 +3844,8 @@ def main():
                 )
             print(f"💾 Estado da ETAPA 1 salvo para run_id={run_id}: {imoveis_parte1_path_run}")
 
-            print("🚀 Atualizando VivaReal após Parte 1...")
-            go_to_integracoes_parceiros_and_update_vivareal()
+            print(f"🚀 Atualizando {portal_target_label()} após Parte 1...")
+            go_to_integracoes_parceiros_and_update_target_portal()
 
         # =====================================================================
         # PARTE INTERMEDIÁRIA
@@ -3725,14 +3858,14 @@ def main():
         _run_state_salvar(status="PARTE_INTERMEDIARIA_CONFIRMADA", imoveis=imoveis_processados)
 
         # =====================================================================
-        # PARTE 2: remarcar VivaReal
+        # PARTE 2: remarcar portal alvo
         # =====================================================================
-        print("\n🚧 ===== PARTE 2: restaurando VivaReal =====")
+        print(f"\n🚧 ===== PARTE 2: restaurando {portal_target_label()} =====")
         print(f"🧾 ETAPA 2 ({run_id}) remarcará somente códigos da ETAPA 1: {[str(i.get('codigo','')).strip() for i in imoveis_processados]}")
         restaurados_parte2, falhas_parte2 = process_part_2_restore_vivareal(imoveis_processados)
 
-        print("🚀 Atualizando VivaReal após Parte 2...")
-        go_to_integracoes_parceiros_and_update_vivareal()
+        print(f"🚀 Atualizando {portal_target_label()} após Parte 2...")
+        go_to_integracoes_parceiros_and_update_target_portal()
 
         if falhas_parte2:
             arquivo_rollback = _gerar_arquivo_rollback_pendente(falhas_parte2, ts_str)
