@@ -109,6 +109,8 @@ wait = None
 actions = None
 HEALTHCHECK_ONLY = "--healthcheck" in sys.argv
 TEST_CANAL_PRO_LOGIN_ONLY = "--test-canal-pro-login" in sys.argv
+AUDIT_PORTAL_UPDATE_ONLY = "--audit-portal-update" in sys.argv
+AUDIT_CLICK_UPDATE = "--audit-click-update" in sys.argv or os.getenv("AUDIT_CLICK_UPDATE", "false").lower() == "true"
 
 
 # =============================================================================
@@ -867,6 +869,176 @@ def go_to_integracoes_parceiros_and_update_vivareal():
         print("✅ Atualização do VivaReal disparada.")
     except Exception as exc:
         print(f"⛔ Não consegui clicar em Atualizar do VivaReal: {type(exc).__name__} | {repr(exc)}")
+
+
+def _portal_button_summary(el):
+    data_attrs = {}
+    try:
+        data_attrs = driver.execute_script(
+            """
+            const out = {};
+            for (const attr of arguments[0].attributes || []) {
+                if (attr.name.startsWith('data-')) out[attr.name] = attr.value;
+            }
+            return out;
+            """,
+            el,
+        ) or {}
+    except Exception:
+        pass
+
+    summary = _element_summary(el)
+    summary.update({
+        "class": _safe_attr(el, "class"),
+        "onclick": _safe_attr(el, "onclick"),
+        "data": data_attrs,
+    })
+    return summary
+
+
+def _collect_browser_network_logs():
+    entries = []
+    try:
+        for item in driver.get_log("performance"):
+            try:
+                msg = json.loads(item.get("message", "{}")).get("message", {})
+                method = msg.get("method")
+                params = msg.get("params", {})
+                if not method or not method.startswith("Network."):
+                    continue
+                request = params.get("request", {})
+                response = params.get("response", {})
+                url = request.get("url") or response.get("url") or ""
+                if not any(term in url.lower() for term in ["rioorla", "portal", "zap", "olx", "vivareal", "po.php", "ajax"]):
+                    continue
+                entries.append({
+                    "method": method,
+                    "url": url,
+                    "request_method": request.get("method"),
+                    "status": response.get("status"),
+                    "mimeType": response.get("mimeType"),
+                    "timestamp": params.get("timestamp"),
+                })
+            except Exception:
+                continue
+    except Exception as exc:
+        entries.append({"error": f"{type(exc).__name__}: {exc}"})
+    return entries
+
+
+def _write_audit_json(out_dir, name, data):
+    with open(os.path.join(out_dir, name), "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def _audit_portal_update():
+    """
+    Diagnóstico sem alteração de imóveis. O clique em Atualizar só ocorre com
+    --audit-click-update, porque esse botão dispara publicação real no CRM.
+    """
+    print("🔎 AUDITORIA PORTAL: modo seguro iniciado.")
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_dir = os.path.join("debug", f"{ts}_audit_portal_update")
+    os.makedirs(out_dir, exist_ok=True)
+    report = {
+        "timestamp": datetime.now().isoformat(),
+        "safe_mode": not AUDIT_CLICK_UPDATE,
+        "audit_click_update": AUDIT_CLICK_UPDATE,
+        "crm_url": CRM_URL,
+        "portal_id_in_code": "9",
+        "findings": [],
+    }
+
+    try:
+        driver.execute_cdp_cmd("Network.enable", {})
+    except Exception as exc:
+        report["network_enable_error"] = f"{type(exc).__name__}: {exc}"
+
+    try:
+        if go_to_imoveis_page_fresh():
+            apply_initial_filters()
+            buttons = driver.find_elements(By.XPATH, "//button[contains(@onclick,'mdImovelUpdate')]")
+            report["filtered_edit_buttons_count"] = len(buttons)
+            if buttons:
+                safe_click(buttons[0])
+                wait.until(EC.visibility_of_element_located((By.ID, "titulo-input")))
+                codigo = get_property_code_from_modal()
+                report["sample_property_code"] = codigo
+                if open_divulgacao_tab():
+                    portal_inputs = driver.find_elements(By.CSS_SELECTOR, "input[data-tipo='portaispagos'][data-portal-check='1']")
+                    report["modal_portal_inputs"] = [_portal_button_summary(el) for el in portal_inputs]
+                    try:
+                        report["vivareal_checked_now"] = is_vivareal_checked()
+                    except Exception as exc:
+                        report["vivareal_checked_error"] = f"{type(exc).__name__}: {exc}"
+                    report["modal_snapshot"] = save_debug_snapshot(driver, "audit_portal_modal_divulgacao")
+                close_any_open_modal()
+                close_known_popup_modals()
+        else:
+            report["findings"].append("Não foi possível abrir a tela de imóveis.")
+    except Exception as exc:
+        report["property_audit_error"] = f"{type(exc).__name__}: {repr(exc)}"
+        debug_modal_state("audit_portal_property_error")
+        close_any_open_modal()
+
+    try:
+        driver.get("https://www.rioorla.com.br/crm/po.php")
+        time.sleep(3)
+        report["partners_url"] = driver.current_url
+        report["partners_snapshot"] = save_debug_snapshot(driver, "audit_portal_partners")
+
+        all_clickables = driver.find_elements(By.CSS_SELECTOR, "a, button, input[type='button'], input[type='submit']")
+        report["all_clickables"] = [_portal_button_summary(el) for el in all_clickables]
+
+        keywords = ["zap", "canal", "olx", "grupo", "publica", "integra", "reprocess", "atualizar", "vivareal", "portal"]
+        related = []
+        for el in all_clickables:
+            summary = _portal_button_summary(el)
+            haystack = " ".join(str(summary.get(k, "")) for k in ["text", "id", "class", "onclick", "outerHTML"]).lower()
+            if any(k in haystack for k in keywords):
+                related.append(summary)
+        report["related_clickables"] = related
+
+        id9 = [
+            item for item in related
+            if '"id":"9"' in (item.get("onclick") or "")
+            or "'id':'9'" in (item.get("onclick") or "")
+            or "id&quot;:&quot;9" in (item.get("outerHTML") or "")
+            or "vivareal" in (item.get("onclick") or "").lower()
+            or "vivareal" in (item.get("text") or "").lower()
+        ]
+        report["id9_or_vivareal_candidates"] = id9
+
+        if AUDIT_CLICK_UPDATE:
+            print("⚠️ AUDITORIA: --audit-click-update ativo. O clique pode disparar publicação real.")
+            before = _collect_browser_network_logs()
+            report["network_before_click"] = before
+            if id9:
+                xpath = (
+                    "//a[contains(@class,'btn-update-portal') and contains(@onclick,'updatePortais') "
+                    "and (contains(@onclick,'\"id\":\"9\"') or contains(@onclick,\"'id':'9'\") "
+                    "or contains(@onclick,'id&quot;:&quot;9') or contains(@onclick,'VivaReal'))]"
+                )
+                btn = wait.until(EC.element_to_be_clickable((By.XPATH, xpath)))
+                report["clicked_button"] = _portal_button_summary(btn)
+                safe_click(btn)
+                time.sleep(120)
+                report["network_after_click"] = _collect_browser_network_logs()
+                report["post_click_snapshot"] = save_debug_snapshot(driver, "audit_portal_after_update_click")
+            else:
+                report["click_skipped_reason"] = "Nenhum candidato id=9/VivaReal encontrado."
+        else:
+            report["click_skipped_reason"] = "Modo seguro: use --audit-click-update para clicar no botão de atualização."
+
+    except Exception as exc:
+        report["partners_audit_error"] = f"{type(exc).__name__}: {repr(exc)}"
+        debug_modal_state("audit_portal_partners_error")
+
+    report["network_logs_collected"] = _collect_browser_network_logs()
+    _write_audit_json(out_dir, "audit_report.json", report)
+    print(f"✅ Auditoria salva em: {out_dir}")
+    print(f"   Relatório: {os.path.join(out_dir, 'audit_report.json')}")
+    return out_dir
 
 
 # =============================================================================
@@ -3357,6 +3529,8 @@ def main():
         return
 
     options = Options()
+    if AUDIT_PORTAL_UPDATE_ONLY:
+        options.set_capability("goog:loggingPrefs", {"performance": "ALL", "browser": "ALL"})
     options.add_argument("--disable-notifications")
     options.add_argument("--disable-popup-blocking")
     options.add_argument("--disable-gpu")
@@ -3445,6 +3619,13 @@ def main():
         driver.find_element(By.NAME, "senha").send_keys(SENHA + Keys.RETURN)
         time.sleep(5)
         print("✅ Login realizado.")
+
+        if AUDIT_PORTAL_UPDATE_ONLY:
+            audit_dir = _audit_portal_update()
+            status_final = "AUDIT_PORTAL_UPDATE_OK"
+            _run_state_salvar(status=status_final, imoveis=[])
+            print(f"🔎 Auditoria concluída sem executar Parte 1/Parte 2: {audit_dir}")
+            return
 
         if MODO_PULAR_PARTE_1:
             # =====================================================================
@@ -3625,11 +3806,12 @@ def main():
                 and len(imoveis_processados) > 0
                 and len(imoveis_processados) < EXPECTATIVA_MINIMA_PARTE_1):
             status_notif = "WARNING_POUCOS_IMOVEIS"
-        _enviar_notificacao_final(
-            status_notif, inicio_execucao,
-            len(imoveis_processados), len(restaurados_parte2),
-            codigos=codigos_processados
-        )
+        if not AUDIT_PORTAL_UPDATE_ONLY:
+            _enviar_notificacao_final(
+                status_notif, inicio_execucao,
+                len(imoveis_processados), len(restaurados_parte2),
+                codigos=codigos_processados
+            )
         if driver and (em_nuvem or os.getenv("FECHAR_BROWSER", "") == "1"):
             try:
                 driver.quit()
