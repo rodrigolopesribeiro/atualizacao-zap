@@ -3939,7 +3939,7 @@ def main():
                 and len(imoveis_processados) > 0
                 and len(imoveis_processados) < EXPECTATIVA_MINIMA_PARTE_1):
             status_notif = "WARNING_POUCOS_IMOVEIS"
-        if not AUDIT_PORTAL_UPDATE_ONLY:
+        if not (AUDIT_PORTAL_UPDATE_ONLY or AUDIT_PROPERTY_PORTAL_ONLY or TEST_CANAL_PRO_LOGIN_ONLY):
             _enviar_notificacao_final(
                 status_notif, inicio_execucao,
                 len(imoveis_processados), len(restaurados_parte2),
