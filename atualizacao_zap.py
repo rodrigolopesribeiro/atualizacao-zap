@@ -128,6 +128,7 @@ AUDIT_PORTAL_UPDATE_ONLY = "--audit-portal-update" in sys.argv
 AUDIT_PROPERTY_PORTAL_ONLY = "--audit-property-portal" in sys.argv
 AUDIT_CLICK_UPDATE = "--audit-click-update" in sys.argv or os.getenv("AUDIT_CLICK_UPDATE", "false").lower() == "true"
 RESTORE_ROLLBACK_ONLY = "--restore-rollback" in sys.argv
+SINGLE_PROPERTY_CYCLE_ONLY = "--single-property-cycle" in sys.argv
 ARG_CODIGO = _arg_value("--codigo")
 ARG_PORTAL_ID = _arg_value("--portal-id")
 ARG_ROLLBACK_FILE = _arg_value("--restore-rollback")
@@ -3344,6 +3345,158 @@ def restore_vivareal_from_rollback_file(path, sync_after=True):
     return restaurados, falhas, result_path
 
 
+def _single_cycle_report_path(codigo):
+    os.makedirs("logs", exist_ok=True)
+    safe_codigo = re.sub(r"[^0-9A-Za-z_-]+", "_", str(codigo))
+    return os.path.join("logs", f"single_property_cycle_{safe_codigo}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
+
+
+def _write_single_cycle_report(path, report):
+    report["updated_at"] = datetime.now().isoformat()
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(report, f, ensure_ascii=False, indent=2)
+
+
+def run_single_property_cycle(codigo):
+    codigo = str(codigo or "").strip()
+    if not codigo:
+        raise Exception("Use --single-property-cycle --codigo CODIGO")
+    require_portal_target_config()
+    if str(PORTAL_TARGET_ID) != VIVAREAL_VALUE:
+        raise Exception(
+            "Rodada controlada bloqueada: portal alvo precisa ser VivaReal/id=9. "
+            f"Config atual: {portal_target_label()}"
+        )
+
+    report_path = _single_cycle_report_path(codigo)
+    report = {
+        "timestamp": datetime.now().isoformat(),
+        "modo": "single_property_cycle",
+        "codigo": codigo,
+        "portal": {
+            "id": VIVAREAL_VALUE,
+            "nome": "VivaReal",
+            "arquivo": "vivareal.php",
+        },
+        "steps": [],
+        "status": "IN_PROGRESS",
+    }
+    _write_single_cycle_report(report_path, report)
+
+    item = None
+    restaurados = []
+    falhas = []
+
+    def step(nome, **extra):
+        entry = {"at": datetime.now().isoformat(), "step": nome}
+        entry.update(extra)
+        report["steps"].append(entry)
+        _write_single_cycle_report(report_path, report)
+
+    print("\n===== RODADA CONTROLADA DE 1 IMOVEL =====")
+    print(f"Codigo: {codigo}")
+    print("Fluxo: desmarcar VivaReal -> atualizar -> monitorar Canal Pro -> remarcar -> atualizar")
+    print(f"Relatorio: {report_path}")
+
+    try:
+        step("buscar_imovel_inicio")
+        if not search_property_by_code_strict(codigo):
+            raise Exception(f"Nao consegui localizar o imovel {codigo}.")
+        edit_property_result_by_code(codigo)
+
+        if not open_divulgacao_tab():
+            raise Exception("Nao consegui abrir Divulgacao dentro do imovel correto.")
+
+        categoria_value, categoria_nome = get_vivareal_category_value()
+        marcado_antes = is_vivareal_checked()
+        step(
+            "estado_inicial_crm",
+            vivareal_marcado=marcado_antes,
+            categoria_vivareal=categoria_value,
+            categoria_nome=categoria_nome,
+        )
+
+        if not marcado_antes:
+            raise Exception(f"Imovel {codigo} ja estava desmarcado em VivaReal/id=9. Rodada controlada abortada.")
+
+        item = {
+            "codigo": codigo,
+            "portal_id": VIVAREAL_VALUE,
+            "portal_nome": "VivaReal",
+            "portal_arquivo": "vivareal.php",
+            "categoria_portal": categoria_value,
+            "categoria_vivareal": categoria_value,
+            "categoria_nome": categoria_nome,
+        }
+
+        set_vivareal_checked(False)
+        save_property()
+        close_known_popup_modals()
+        close_any_open_modal()
+        step("etapa_1_desmarcado_salvo", item=item)
+
+        print("Atualizando VivaReal/id=9 apos desmarcar o imovel unico...")
+        go_to_integracoes_parceiros_and_update_vivareal()
+        step("atualizacao_vivareal_pos_desmarque_disparada")
+
+        print("Monitorando Canal Pro para confirmar remocao do unico codigo...")
+        removidos_confirmados = verify_properties_removed_from_zap([item])
+        step("parte_intermediaria_concluida", removidos_confirmados=bool(removidos_confirmados))
+        if not removidos_confirmados:
+            raise Exception("Parte Intermediaria nao confirmou remocao do codigo unico.")
+
+        print("Remarcando VivaReal/id=9 para o imovel unico...")
+        restaurados, falhas = process_part_2_restore_vivareal([item])
+        step(
+            "etapa_2_remarcacao",
+            restaurados=[i.get("codigo") for i in restaurados],
+            falhas=[i.get("codigo") for i in falhas],
+        )
+        if falhas:
+            raise Exception(f"Falha ao remarcar o codigo unico: {[i.get('codigo') for i in falhas]}")
+
+        print("Atualizando VivaReal/id=9 apos remarcar o imovel unico...")
+        go_to_integracoes_parceiros_and_update_vivareal()
+        step("atualizacao_vivareal_pos_remarque_disparada")
+
+        report["status"] = "SUCCESS"
+        report["restaurados"] = restaurados
+        report["falhas"] = falhas
+        _write_single_cycle_report(report_path, report)
+        print(f"Rodada controlada concluida com sucesso. Relatorio: {report_path}")
+        return "SUCCESS", [item], restaurados, falhas, report_path
+
+    except Exception as exc:
+        report["status"] = "ERROR"
+        report["error"] = f"{type(exc).__name__}: {exc}"
+        step("erro", error=report["error"])
+        print(f"ERRO na rodada controlada: {report['error']}")
+
+        if item:
+            try:
+                print("Tentando restauracao de seguranca do VivaReal/id=9 para o codigo unico...")
+                ok = _process_single_item_restore_vivareal(item)
+                if ok:
+                    restaurados = [item]
+                    report["safety_restore"] = "OK"
+                    print("Restauracao de seguranca concluida.")
+                    try:
+                        go_to_integracoes_parceiros_and_update_vivareal()
+                        report["safety_restore_sync"] = "OK"
+                    except Exception as sync_exc:
+                        report["safety_restore_sync"] = f"{type(sync_exc).__name__}: {sync_exc}"
+                else:
+                    falhas = [item]
+                    report["safety_restore"] = "FAILED"
+            except Exception as rb_exc:
+                falhas = [item]
+                report["safety_restore"] = f"{type(rb_exc).__name__}: {rb_exc}"
+                print(f"Falha na restauracao de seguranca: {report['safety_restore']}")
+
+        _write_single_cycle_report(report_path, report)
+        return "ERROR_SINGLE_PROPERTY_CYCLE", ([item] if item else []), restaurados, falhas, report_path
+
+
 # =============================================================================
 # PROXY
 # =============================================================================
@@ -3637,6 +3790,15 @@ def _healthcheck_completo():
 
 
 def _iniciar_chrome_com_retry(options, usando_headless):
+    def _chrome_service():
+        driver_path = os.getenv("CHROMEDRIVER_PATH", "").strip()
+        if driver_path:
+            if not os.path.exists(driver_path):
+                raise Exception(f"CHROMEDRIVER_PATH informado, mas nao existe: {driver_path}")
+            print(f"   Usando ChromeDriver fixo: {driver_path}")
+            return Service(driver_path)
+        return Service(ChromeDriverManager().install())
+
     MAX_TENTATIVAS = 5
     BACKOFF = [5, 10, 20, 40]
 
@@ -3646,7 +3808,7 @@ def _iniciar_chrome_com_retry(options, usando_headless):
         print(f"🖥️  Tentativa {tentativa}/{MAX_TENTATIVAS} — iniciando Chrome...")
         print(f"   Argumentos: {options.arguments}")
         try:
-            service = Service(ChromeDriverManager().install())
+            service = _chrome_service()
             d = webdriver.Chrome(service=service, options=options)
             d.set_page_load_timeout(30)
             _ = d.current_url
@@ -3690,7 +3852,7 @@ def _iniciar_chrome_com_retry(options, usando_headless):
             for arg in options.arguments:
                 if "--proxy-server" not in arg:
                     opts_fb.add_argument(arg)
-            service = Service(ChromeDriverManager().install())
+            service = _chrome_service()
             d = webdriver.Chrome(service=service, options=opts_fb)
             d.set_page_load_timeout(30)
             _ = d.current_url
@@ -3824,6 +3986,10 @@ def main():
         options.add_argument("--disable-ipc-flooding-protection")
     else:
         options.add_argument("--start-maximized")
+        options.add_argument("--no-first-run")
+        options.add_argument("--no-default-browser-check")
+        options.add_argument("--disable-extensions")
+        options.add_argument("--remote-debugging-port=0")
 
     # Diretório temporário isolado por execução (evita conflito de lock files)
     temp_chrome_dir = tempfile.mkdtemp(prefix="chrome_session_")
@@ -3878,6 +4044,12 @@ def main():
         driver.find_element(By.NAME, "senha").send_keys(SENHA + Keys.RETURN)
         time.sleep(5)
         print("✅ Login realizado.")
+
+        if SINGLE_PROPERTY_CYCLE_ONLY:
+            status_final, imoveis_processados, restaurados_parte2, falhas_parte2, result_path = run_single_property_cycle(ARG_CODIGO)
+            _run_state_salvar(status=status_final, imoveis=imoveis_processados)
+            print(f"Relatorio da rodada controlada: {result_path}")
+            return
 
         if RESTORE_ROLLBACK_ONLY:
             restaurados_parte2, falhas_parte2, result_path = restore_vivareal_from_rollback_file(
@@ -4093,7 +4265,7 @@ def main():
                 and len(imoveis_processados) > 0
                 and len(imoveis_processados) < EXPECTATIVA_MINIMA_PARTE_1):
             status_notif = "WARNING_POUCOS_IMOVEIS"
-        if not (AUDIT_PORTAL_UPDATE_ONLY or AUDIT_PROPERTY_PORTAL_ONLY or TEST_CANAL_PRO_LOGIN_ONLY or RESTORE_ROLLBACK_ONLY):
+        if not (AUDIT_PORTAL_UPDATE_ONLY or AUDIT_PROPERTY_PORTAL_ONLY or TEST_CANAL_PRO_LOGIN_ONLY or RESTORE_ROLLBACK_ONLY or SINGLE_PROPERTY_CYCLE_ONLY):
             _enviar_notificacao_final(
                 status_notif, inicio_execucao,
                 len(imoveis_processados), len(restaurados_parte2),
