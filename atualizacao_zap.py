@@ -127,8 +127,11 @@ TEST_CANAL_PRO_LOGIN_ONLY = "--test-canal-pro-login" in sys.argv
 AUDIT_PORTAL_UPDATE_ONLY = "--audit-portal-update" in sys.argv
 AUDIT_PROPERTY_PORTAL_ONLY = "--audit-property-portal" in sys.argv
 AUDIT_CLICK_UPDATE = "--audit-click-update" in sys.argv or os.getenv("AUDIT_CLICK_UPDATE", "false").lower() == "true"
+RESTORE_ROLLBACK_ONLY = "--restore-rollback" in sys.argv
 ARG_CODIGO = _arg_value("--codigo")
 ARG_PORTAL_ID = _arg_value("--portal-id")
+ARG_ROLLBACK_FILE = _arg_value("--restore-rollback")
+NO_SYNC_AFTER_RESTORE = "--no-sync-after-restore" in sys.argv
 
 
 # =============================================================================
@@ -3205,6 +3208,142 @@ def process_part_2_restore_vivareal(imoveis_processados):
     return restaurados_parte2, falhas_parte2
 
 
+def _carregar_rollback_pendente(path):
+    if not path:
+        raise Exception("Informe o arquivo: --restore-rollback state/rollback_pendente_YYYYMMDD_HHMM.json")
+    if not os.path.exists(path):
+        raise Exception(f"Arquivo de rollback nao encontrado: {path}")
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    pendentes = data.get("pendentes") or data.get("imoveis") or []
+    if not isinstance(pendentes, list) or not pendentes:
+        raise Exception(f"Arquivo de rollback sem lista de pendentes/imoveis: {path}")
+    normalizados = []
+    for item in pendentes:
+        if not isinstance(item, dict):
+            continue
+        codigo = str(item.get("codigo") or "").strip()
+        if not codigo:
+            continue
+        categoria = str(item.get("categoria_vivareal", item.get("categoria_portal", "0"))).strip() or "0"
+        normalizados.append({
+            "codigo": codigo,
+            "categoria_vivareal": categoria,
+            "categoria_nome": item.get("categoria_nome") or get_vivareal_category_label(categoria),
+        })
+    if not normalizados:
+        raise Exception(f"Nenhum codigo valido no rollback: {path}")
+    return data, normalizados
+
+
+def _process_single_item_restore_vivareal(item):
+    codigo = (item.get("codigo") or "").strip()
+    categoria_value = str(item.get("categoria_vivareal", item.get("categoria_portal", "0"))).strip() or "0"
+    categoria_nome = item.get("categoria_nome") or get_vivareal_category_label(categoria_value)
+
+    if categoria_value not in CATEGORIAS_VIVAREAL:
+        categoria_value = "0"
+        categoria_nome = "Simples"
+
+    if not codigo:
+        print("Item sem codigo. Pulando.")
+        return False
+
+    print(f"RESTORE-ONLY: remarcando VivaReal para codigo {codigo}")
+
+    if not search_property_by_code_strict(codigo):
+        return False
+
+    edit_property_result_by_code(codigo)
+
+    if not open_divulgacao_tab():
+        raise Exception("Nao consegui abrir Divulgacao dentro do imovel correto.")
+
+    set_vivareal_checked(True)
+    set_vivareal_category_value(categoria_value)
+    save_property()
+    print(f"RESTORE-ONLY concluido para {codigo}: VivaReal marcado como {categoria_nome} ({categoria_value}).")
+    close_any_open_modal()
+    return True
+
+
+def restore_vivareal_from_rollback_file(path, sync_after=True):
+    data, pendentes = _carregar_rollback_pendente(path)
+    print("\n===== RESTORE-ONLY: recuperando rollback pendente =====")
+    print(f"Arquivo: {path}")
+    print(f"Gerado em: {data.get('gerado_em', '?')}")
+    print(f"Total a restaurar em VivaReal/id=9: {len(pendentes)}")
+    print(f"Codigos: {[item['codigo'] for item in pendentes]}")
+
+    restaurados = []
+    falhas = []
+
+    for item in pendentes:
+        codigo = item["codigo"]
+        try:
+            ok = _process_single_item_restore_vivareal(item)
+            if ok:
+                restaurados.append(item)
+            else:
+                falhas.append(item)
+        except Exception as exc:
+            print(f"RESTORE-ONLY falhou no codigo {codigo}: {type(exc).__name__} | {repr(exc)}")
+            debug_modal_state(f"restore_rollback_codigo_{codigo}")
+            close_any_open_modal()
+            falhas.append(item)
+
+    if falhas:
+        print(f"RESTORE-ONLY: reprocessando {len(falhas)} falha(s).")
+        pendentes_retry = list(falhas)
+        falhas = []
+        for item in pendentes_retry:
+            codigo = item["codigo"]
+            try:
+                ok = _process_single_item_restore_vivareal(item)
+                if ok:
+                    restaurados.append(item)
+                else:
+                    falhas.append(item)
+            except Exception as exc:
+                print(f"RESTORE-ONLY retry falhou no codigo {codigo}: {type(exc).__name__} | {repr(exc)}")
+                debug_modal_state(f"restore_rollback_retry_codigo_{codigo}")
+                close_any_open_modal()
+                falhas.append(item)
+
+    if sync_after and not falhas:
+        print("RESTORE-ONLY: atualizando VivaReal/id=9 apos restaurar todos os imoveis.")
+        go_to_integracoes_parceiros_and_update_vivareal()
+    elif sync_after and falhas:
+        print("RESTORE-ONLY: sync VivaReal bloqueado porque ainda existem falhas.")
+    else:
+        print("RESTORE-ONLY: sync VivaReal pulado por opcao --no-sync-after-restore.")
+
+    os.makedirs("logs", exist_ok=True)
+    result = {
+        "timestamp": datetime.now().isoformat(),
+        "rollback_file": path,
+        "total": len(pendentes),
+        "restaurados": restaurados,
+        "falhas": falhas,
+        "sync_after": bool(sync_after and not falhas),
+    }
+    result_path = os.path.join("logs", f"restore_rollback_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
+    with open(result_path, "w", encoding="utf-8") as f:
+        json.dump(result, f, ensure_ascii=False, indent=2)
+    print(f"RESTORE-ONLY: resultado salvo em {result_path}")
+
+    if not falhas:
+        os.makedirs(ARCHIVE_DIR, exist_ok=True)
+        archive_path = os.path.join(
+            ARCHIVE_DIR,
+            os.path.basename(path) + f".restored_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        )
+        shutil.move(path, archive_path)
+        print(f"RESTORE-ONLY: rollback arquivado em {archive_path}")
+
+    return restaurados, falhas, result_path
+
+
 # =============================================================================
 # PROXY
 # =============================================================================
@@ -3740,6 +3879,21 @@ def main():
         time.sleep(5)
         print("✅ Login realizado.")
 
+        if RESTORE_ROLLBACK_ONLY:
+            restaurados_parte2, falhas_parte2, result_path = restore_vivareal_from_rollback_file(
+                ARG_ROLLBACK_FILE,
+                sync_after=not NO_SYNC_AFTER_RESTORE,
+            )
+            imoveis_processados = restaurados_parte2 + falhas_parte2
+            if falhas_parte2:
+                status_final = "RESTORE_ROLLBACK_PARTIAL"
+                _run_state_salvar(status=status_final, imoveis=imoveis_processados)
+                print(f"RESTORE-ONLY parcial. Ver resultado em {result_path}")
+                return
+            status_final = "RESTORE_ROLLBACK_OK"
+            _run_state_salvar(status=status_final, imoveis=imoveis_processados)
+            return
+
         if AUDIT_PORTAL_UPDATE_ONLY:
             audit_dir = _audit_portal_update()
             status_final = "AUDIT_PORTAL_UPDATE_OK"
@@ -3939,7 +4093,7 @@ def main():
                 and len(imoveis_processados) > 0
                 and len(imoveis_processados) < EXPECTATIVA_MINIMA_PARTE_1):
             status_notif = "WARNING_POUCOS_IMOVEIS"
-        if not (AUDIT_PORTAL_UPDATE_ONLY or AUDIT_PROPERTY_PORTAL_ONLY or TEST_CANAL_PRO_LOGIN_ONLY):
+        if not (AUDIT_PORTAL_UPDATE_ONLY or AUDIT_PROPERTY_PORTAL_ONLY or TEST_CANAL_PRO_LOGIN_ONLY or RESTORE_ROLLBACK_ONLY):
             _enviar_notificacao_final(
                 status_notif, inicio_execucao,
                 len(imoveis_processados), len(restaurados_parte2),
