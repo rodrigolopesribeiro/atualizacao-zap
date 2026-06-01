@@ -46,6 +46,35 @@ def _arg_value(name, default=None):
         return default
 
 
+def _arg_float(name, default):
+    raw = _arg_value(name)
+    if raw is None:
+        raw = os.getenv(name.lstrip("-").upper().replace("-", "_"), default)
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        raise ValueError(f"Valor invalido para {name}: {raw!r}")
+
+
+def _positive_seconds_from_hours(hours, name):
+    if hours <= 0:
+        raise ValueError(f"{name} deve ser maior que zero.")
+    return int(hours * 3600)
+
+
+def _positive_seconds_from_minutes(minutes, name):
+    if minutes <= 0:
+        raise ValueError(f"{name} deve ser maior que zero.")
+    return int(minutes * 60)
+
+
+class IntermediariaTimeoutError(TimeoutError):
+    def __init__(self, message, report_path=None, pending_codes=None):
+        super().__init__(message)
+        self.report_path = report_path
+        self.pending_codes = pending_codes or []
+
+
 # === CONFIGURACOES CRM ===
 USUARIO = os.environ["CRM_USUARIO"]
 SENHA = os.environ["CRM_SENHA"]
@@ -72,8 +101,14 @@ GMAIL_SCOPES           = [
 GMAIL_DESTINATARIO     = "mkmarcoslopes@gmail.com"
 CANAL_PRO_URL_LOGIN    = "https://canalpro.grupozap.com/login"
 CANAL_PRO_URL_LISTINGS = "https://canalpro.grupozap.com/ZAP_OLX/0/listings"
-VERIFICACAO_INTERVALO_SEGUNDOS = 1800  # 30 minutos entre verificações
-VERIFICACAO_TIMEOUT_SEGUNDOS   = 8 * 3600  # timeout máximo de 8 horas
+VERIFICACAO_INTERVALO_MINUTOS = _arg_float("--interval-minutes", os.getenv("INTERVAL_MINUTES", "30"))
+VERIFICACAO_MAX_WAIT_HOURS = _arg_float("--max-wait-hours", os.getenv("MAX_WAIT_HOURS", "8"))
+VERIFICACAO_INTERVALO_SEGUNDOS = _positive_seconds_from_minutes(
+    VERIFICACAO_INTERVALO_MINUTOS, "--interval-minutes"
+)
+VERIFICACAO_TIMEOUT_SEGUNDOS = _positive_seconds_from_hours(
+    VERIFICACAO_MAX_WAIT_HOURS, "--max-wait-hours"
+)
 MINIMO_CODIGOS_ESPERADOS_CANAL_PRO = 10
 MAX_ERROS_CONSECUTIVOS_SCRAPING = 5
 # Aliases para compatibilidade
@@ -1180,6 +1215,47 @@ def _run_state_salvar(status, imoveis=None):
     }
     with open(run_state_path, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
+
+
+def _formatar_duracao(segundos):
+    segundos = max(0, int(segundos))
+    horas, resto = divmod(segundos, 3600)
+    minutos, seg = divmod(resto, 60)
+    if horas:
+        return f"{horas}h{minutos:02d}m"
+    if minutos:
+        return f"{minutos}m{seg:02d}s"
+    return f"{seg}s"
+
+
+def _logs_json_path(prefix):
+    os.makedirs("logs", exist_ok=True)
+    run_id = _RUN_CONTEXT.get("run_id") or datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_run_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", run_id)
+    return os.path.join("logs", f"{prefix}_{safe_run_id}.json")
+
+
+def _write_json_atomic(path, payload):
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    tmp_path = f"{path}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    os.replace(tmp_path, path)
+
+
+def _update_json_file(path, **updates):
+    if not path:
+        return
+    try:
+        payload = {}
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+        payload.update(updates)
+        payload["updated_at"] = datetime.now().isoformat()
+        _write_json_atomic(path, payload)
+    except Exception as exc:
+        print(f"⚠️ Falha ao atualizar JSON {path}: {exc}")
 
 
 def _preparar_estado_inicio_execucao(modo_resume=False, teste_local=False):
@@ -2987,7 +3063,13 @@ def _selftest_parte_intermediaria():
     print("✅ Self-test Parte Intermediária: cenários críticos validados.")
 
 
-def verify_properties_removed_from_zap(imoveis_processados):
+def verify_properties_removed_from_zap(
+        imoveis_processados,
+        max_wait_seconds=None,
+        interval_seconds=None,
+        modo="parte_intermediaria",
+        report_path=None,
+        return_details=False):
     """
     Parte Intermediária: abre o Canal Pro em nova aba e verifica a cada
     VERIFICACAO_INTERVALO_SEGUNDOS se os imóveis da Parte 1 foram removidos
@@ -2997,10 +3079,41 @@ def verify_properties_removed_from_zap(imoveis_processados):
     if not imoveis_processados:
         raise Exception("ETAPA INTERMEDIÁRIA sem imóveis da ETAPA 1 da execução atual. Parte 2 bloqueada.")
 
+    max_wait_seconds = int(max_wait_seconds or VERIFICACAO_TIMEOUT_SEGUNDOS)
+    interval_seconds = int(interval_seconds or VERIFICACAO_INTERVALO_SEGUNDOS)
+    max_wait_hours = round(max_wait_seconds / 3600, 4)
+    interval_minutes = round(interval_seconds / 60, 4)
     codigos_alvo = {str(item["codigo"]).strip() for item in imoveis_processados}
+    report_path = report_path or _logs_json_path("parte_intermediaria")
+    report = {
+        "run_id": _RUN_CONTEXT.get("run_id"),
+        "modo": modo,
+        "started_at": datetime.now().isoformat(),
+        "updated_at": datetime.now().isoformat(),
+        "codigos_alvo": sorted(codigos_alvo),
+        "verificacoes_realizadas": 0,
+        "max_wait_hours": max_wait_hours,
+        "interval_minutes": interval_minutes,
+        "removed_confirmed": False,
+        "timeout_reached": False,
+        "etapa2_executada": False,
+        "rollback_executado": False,
+        "pending_codes_final": sorted(codigos_alvo),
+        "status_final": "IN_PROGRESS",
+        "verificacoes": [],
+    }
+
+    def salvar_report(**updates):
+        report.update(updates)
+        report["updated_at"] = datetime.now().isoformat()
+        _write_json_atomic(report_path, report)
+
+    salvar_report()
     print(f"\n🔍 Parte Intermediária: monitorando remoção de {len(codigos_alvo)} imóvel(is) no ZAP Imóveis...")
     print(f"   Códigos aguardados: {sorted(codigos_alvo)}")
-    print(f"   Intervalo entre verificações: {VERIFICACAO_INTERVALO_SEGUNDOS // 60} minuto(s)\n")
+    print(f"   Tempo máximo: {_formatar_duracao(max_wait_seconds)}")
+    print(f"   Intervalo entre verificações: {_formatar_duracao(interval_seconds)}")
+    print(f"   Relatório da Parte Intermediária: {report_path}\n")
 
     aba_crm = _canal_pro_login()
     try:
@@ -3010,19 +3123,40 @@ def verify_properties_removed_from_zap(imoveis_processados):
 
     inicio = time.time()
     tentativa = 1
+    ultimo_ainda_ativos = set(codigos_alvo)
 
     try:
         erros_consecutivos = 0
         ultimo_total_valido = 0
         while True:
             # Verifica timeout
-            if time.time() - inicio > VERIFICACAO_TIMEOUT_SEGUNDOS:
-                print(f"⛔ TIMEOUT: imóveis não foram removidos do ZAP em "
-                      f"{VERIFICACAO_TIMEOUT_SEGUNDOS // 3600} hora(s). Encerrando.")
-                raise TimeoutError(f"Timeout de {VERIFICACAO_TIMEOUT_SEGUNDOS // 3600}h na verificação do Canal Pro.")
+            elapsed = time.time() - inicio
+            if elapsed > max_wait_seconds:
+                salvar_report(
+                    verificacoes_realizadas=max(0, tentativa - 1),
+                    removed_confirmed=False,
+                    timeout_reached=True,
+                    pending_codes_final=sorted(ultimo_ainda_ativos),
+                    status_final="ERROR_TIMEOUT_INTERMEDIARIA",
+                    finished_at=datetime.now().isoformat(),
+                )
+                print("⛔ TIMEOUT DA PARTE INTERMEDIÁRIA")
+                print("   Remoção NÃO confirmada.")
+                print("   A Parte 2 permanece bloqueada.")
+                print(f"   Tempo decorrido: {_formatar_duracao(elapsed)}")
+                print(f"   Tempo máximo: {_formatar_duracao(max_wait_seconds)}")
+                print(f"   Pendentes finais: {sorted(ultimo_ainda_ativos)}")
+                raise IntermediariaTimeoutError(
+                    "ERROR_TIMEOUT_INTERMEDIARIA: imóveis ainda ativos no Canal Pro. "
+                    f"Pendentes: {sorted(ultimo_ainda_ativos)}",
+                    report_path=report_path,
+                    pending_codes=sorted(ultimo_ainda_ativos),
+                )
 
             horario = datetime.now().strftime("%H:%M:%S")
             print(f"🔍 [{horario}] Verificação #{tentativa} — varrendo anúncios no Canal Pro...")
+            print(f"   Tempo decorrido: {_formatar_duracao(elapsed)}")
+            print(f"   Tempo máximo: {_formatar_duracao(max_wait_seconds)}")
 
             if sessao_canal_pro_expirada(driver):
                 print("⚠️ Sessão do Canal Pro expirada. Refazendo login...")
@@ -3043,10 +3177,30 @@ def verify_properties_removed_from_zap(imoveis_processados):
 
             if avaliacao.get("erro_scraping"):
                 erros_consecutivos += 1
+                ultimo_ainda_ativos = set(codigos_alvo)
                 contador = _canal_pro_obter_contador_oficial_texto()
                 cards = len(driver.find_elements(By.CSS_SELECTOR, "span.card-content__tag"))
                 lista_vazia, _ = _canal_pro_lista_vazia_confirmada()
                 login_visivel = sessao_canal_pro_expirada(driver)
+                report["verificacoes"].append({
+                    "numero": tentativa,
+                    "horario": horario,
+                    "tempo_decorrido_segundos": int(elapsed),
+                    "tempo_decorrido": _formatar_duracao(elapsed),
+                    "tempo_maximo": _formatar_duracao(max_wait_seconds),
+                    "erro_scraping": True,
+                    "motivo": avaliacao.get("motivo"),
+                    "total_anuncios_canal_pro": avaliacao.get("total_atual", 0),
+                    "pendentes": sorted(ultimo_ainda_ativos),
+                    "removidos": [],
+                    "resultado": "verificacao_invalida",
+                })
+                salvar_report(
+                    verificacoes_realizadas=tentativa,
+                    removed_confirmed=False,
+                    pending_codes_final=sorted(ultimo_ainda_ativos),
+                    status_final="IN_PROGRESS_SCRAPING_ERROR",
+                )
                 print("⛔ VERIFICAÇÃO INVÁLIDA")
                 print(f"   Motivo: {avaliacao.get('motivo')}")
                 print(f"   URL atual: {driver.current_url}")
@@ -3060,6 +3214,13 @@ def verify_properties_removed_from_zap(imoveis_processados):
 
                 if erros_consecutivos >= MAX_ERROS_CONSECUTIVOS_SCRAPING:
                     pendentes = sorted(codigos_alvo)
+                    salvar_report(
+                        removed_confirmed=False,
+                        timeout_reached=False,
+                        pending_codes_final=pendentes,
+                        status_final="ERROR_INTERMEDIARIA_SCRAPING",
+                        finished_at=datetime.now().isoformat(),
+                    )
                     msg = (
                         "PARTE_INTERMEDIARIA_ABORTADA: erros consecutivos de scraping no Canal Pro. "
                         "Parte 2 não executada. Imóveis podem estar desmarcados no CRM/VivaReal e exigem atenção manual. "
@@ -3068,8 +3229,8 @@ def verify_properties_removed_from_zap(imoveis_processados):
                     raise Exception(msg)
 
                 print(f"   ⚠️ Erros consecutivos: {erros_consecutivos}/{MAX_ERROS_CONSECUTIVOS_SCRAPING}")
-                print(f"   ⏱️ Nova tentativa em {VERIFICACAO_INTERVALO_SEGUNDOS // 60} minuto(s).")
-                time.sleep(VERIFICACAO_INTERVALO_SEGUNDOS)
+                print(f"   ⏱️ Nova tentativa em {_formatar_duracao(interval_seconds)}.")
+                time.sleep(interval_seconds)
                 tentativa += 1
                 _canal_pro_navigate_to_listings()
                 continue
@@ -3084,6 +3245,25 @@ def verify_properties_removed_from_zap(imoveis_processados):
 
             ainda_ativos = avaliacao["ainda_ativos"]
             ja_removidos = codigos_alvo - ativos
+            ultimo_ainda_ativos = set(ainda_ativos)
+            report["verificacoes"].append({
+                "numero": tentativa,
+                "horario": horario,
+                "tempo_decorrido_segundos": int(elapsed),
+                "tempo_decorrido": _formatar_duracao(elapsed),
+                "tempo_maximo": _formatar_duracao(max_wait_seconds),
+                "erro_scraping": False,
+                "total_anuncios_canal_pro": total_ativos,
+                "pendentes": sorted(ainda_ativos),
+                "removidos": sorted(ja_removidos),
+                "resultado": "todos_removidos" if not ainda_ativos else "aguardando_proxima_verificacao",
+            })
+            salvar_report(
+                verificacoes_realizadas=tentativa,
+                removed_confirmed=False,
+                pending_codes_final=sorted(ainda_ativos),
+                status_final="IN_PROGRESS",
+            )
 
             if ja_removidos:
                 print(f"   ✅ Já removidos do ZAP: {sorted(ja_removidos)}")
@@ -3091,12 +3271,27 @@ def verify_properties_removed_from_zap(imoveis_processados):
             if not ainda_ativos:
                 print("✅ TODOS os imóveis confirmados como removidos do ZAP Imóveis!")
                 print("🔒 Fechando aba do Canal Pro e retornando ao CRM...\n")
+                salvar_report(
+                    removed_confirmed=True,
+                    timeout_reached=False,
+                    pending_codes_final=[],
+                    status_final="REMOVED_CONFIRMED",
+                    finished_at=datetime.now().isoformat(),
+                )
+                if return_details:
+                    return {
+                        "removed_confirmed": True,
+                        "report_path": report_path,
+                        "pending_codes_final": [],
+                        "verificacoes_realizadas": tentativa,
+                    }
                 return True
 
             proxima = datetime.now().strftime("%H:%M:%S")
             print(f"   ⏳ Ainda ativos no ZAP ({len(ainda_ativos)} imóvel(is)): {sorted(ainda_ativos)}")
-            print(f"   ⏱️ Próxima verificação em {VERIFICACAO_INTERVALO_SEGUNDOS // 60} minuto(s)... [{proxima}]")
-            time.sleep(VERIFICACAO_INTERVALO_SEGUNDOS)
+            print(f"   ✅ Removidos: {len(ja_removidos)} | Pendentes: {len(ainda_ativos)}")
+            print(f"   ⏱️ Próxima verificação em {_formatar_duracao(interval_seconds)}... [{proxima}]")
+            time.sleep(interval_seconds)
             tentativa += 1
 
             # Renavega para listings (sem novo login)
@@ -3357,7 +3552,7 @@ def _write_single_cycle_report(path, report):
         json.dump(report, f, ensure_ascii=False, indent=2)
 
 
-def run_single_property_cycle(codigo):
+def run_single_property_cycle(codigo, max_wait_seconds=None, interval_seconds=None):
     codigo = str(codigo or "").strip()
     if not codigo:
         raise Exception("Use --single-property-cycle --codigo CODIGO")
@@ -3369,8 +3564,11 @@ def run_single_property_cycle(codigo):
         )
 
     report_path = _single_cycle_report_path(codigo)
+    max_wait_seconds = int(max_wait_seconds or VERIFICACAO_TIMEOUT_SEGUNDOS)
+    interval_seconds = int(interval_seconds or VERIFICACAO_INTERVALO_SEGUNDOS)
     report = {
         "timestamp": datetime.now().isoformat(),
+        "run_id": _RUN_CONTEXT.get("run_id"),
         "modo": "single_property_cycle",
         "codigo": codigo,
         "portal": {
@@ -3380,6 +3578,15 @@ def run_single_property_cycle(codigo):
         },
         "steps": [],
         "status": "IN_PROGRESS",
+        "status_final": "IN_PROGRESS",
+        "verificacoes_realizadas": 0,
+        "max_wait_hours": round(max_wait_seconds / 3600, 4),
+        "interval_minutes": round(interval_seconds / 60, 4),
+        "removed_confirmed": False,
+        "timeout_reached": False,
+        "etapa2_executada": False,
+        "rollback_executado": False,
+        "pending_codes_final": [codigo],
     }
     _write_single_cycle_report(report_path, report)
 
@@ -3396,6 +3603,8 @@ def run_single_property_cycle(codigo):
     print("\n===== RODADA CONTROLADA DE 1 IMOVEL =====")
     print(f"Codigo: {codigo}")
     print("Fluxo: desmarcar VivaReal -> atualizar -> monitorar Canal Pro -> remarcar -> atualizar")
+    print(f"Tempo maximo da Parte Intermediaria: {_formatar_duracao(max_wait_seconds)}")
+    print(f"Intervalo entre verificacoes: {_formatar_duracao(interval_seconds)}")
     print(f"Relatorio: {report_path}")
 
     try:
@@ -3440,12 +3649,23 @@ def run_single_property_cycle(codigo):
         step("atualizacao_vivareal_pos_desmarque_disparada")
 
         print("Monitorando Canal Pro para confirmar remocao do unico codigo...")
-        removidos_confirmados = verify_properties_removed_from_zap([item])
-        step("parte_intermediaria_concluida", removidos_confirmados=bool(removidos_confirmados))
-        if not removidos_confirmados:
-            raise Exception("Parte Intermediaria nao confirmou remocao do codigo unico.")
+        resultado_intermediaria = verify_properties_removed_from_zap(
+            [item],
+            max_wait_seconds=max_wait_seconds,
+            interval_seconds=interval_seconds,
+            modo="single_property_cycle",
+            return_details=True,
+        )
+        removidos_confirmados = resultado_intermediaria.get("removed_confirmed") is True
+        report["verificacoes_realizadas"] = resultado_intermediaria.get("verificacoes_realizadas", 0)
+        report["pending_codes_final"] = resultado_intermediaria.get("pending_codes_final", [codigo])
+        report["removed_confirmed"] = removidos_confirmados
+        step("parte_intermediaria_concluida", removidos_confirmados=removidos_confirmados)
+        if removidos_confirmados is not True:
+            raise RuntimeError("Etapa 2 bloqueada: imóveis ainda ativos no Canal Pro.")
 
         print("Remarcando VivaReal/id=9 para o imovel unico...")
+        report["etapa2_executada"] = True
         restaurados, falhas = process_part_2_restore_vivareal([item])
         step(
             "etapa_2_remarcacao",
@@ -3460,6 +3680,8 @@ def run_single_property_cycle(codigo):
         step("atualizacao_vivareal_pos_remarque_disparada")
 
         report["status"] = "SUCCESS"
+        report["status_final"] = "SUCCESS"
+        report["pending_codes_final"] = []
         report["restaurados"] = restaurados
         report["falhas"] = falhas
         _write_single_cycle_report(report_path, report)
@@ -3467,7 +3689,16 @@ def run_single_property_cycle(codigo):
         return "SUCCESS", [item], restaurados, falhas, report_path
 
     except Exception as exc:
-        report["status"] = "ERROR"
+        is_timeout_intermediaria = isinstance(exc, TimeoutError) and "ERROR_TIMEOUT_INTERMEDIARIA" in str(exc)
+        report["status"] = "ERROR_TIMEOUT" if is_timeout_intermediaria else "ERROR"
+        report["status_final"] = (
+            "ERROR_TIMEOUT_INTERMEDIARIA" if is_timeout_intermediaria else "ERROR_SINGLE_PROPERTY_CYCLE"
+        )
+        report["timeout_reached"] = bool(is_timeout_intermediaria)
+        report["removed_confirmed"] = False
+        report["etapa2_executada"] = False
+        if hasattr(exc, "pending_codes"):
+            report["pending_codes_final"] = list(getattr(exc, "pending_codes") or [codigo])
         report["error"] = f"{type(exc).__name__}: {exc}"
         step("erro", error=report["error"])
         print(f"ERRO na rodada controlada: {report['error']}")
@@ -3479,6 +3710,9 @@ def run_single_property_cycle(codigo):
                 if ok:
                     restaurados = [item]
                     report["safety_restore"] = "OK"
+                    report["rollback_executado"] = True
+                    if is_timeout_intermediaria:
+                        report["status_final"] = "ERROR_TIMEOUT_ROLLBACK"
                     print("Restauracao de seguranca concluida.")
                     try:
                         go_to_integracoes_parceiros_and_update_vivareal()
@@ -3488,13 +3722,19 @@ def run_single_property_cycle(codigo):
                 else:
                     falhas = [item]
                     report["safety_restore"] = "FAILED"
+                    report["rollback_executado"] = True
+                    if is_timeout_intermediaria:
+                        report["status_final"] = "ERROR_TIMEOUT_ROLLBACK_PENDING"
             except Exception as rb_exc:
                 falhas = [item]
                 report["safety_restore"] = f"{type(rb_exc).__name__}: {rb_exc}"
+                report["rollback_executado"] = True
+                if is_timeout_intermediaria:
+                    report["status_final"] = "ERROR_TIMEOUT_ROLLBACK_PENDING"
                 print(f"Falha na restauracao de seguranca: {report['safety_restore']}")
 
         _write_single_cycle_report(report_path, report)
-        return "ERROR_SINGLE_PROPERTY_CYCLE", ([item] if item else []), restaurados, falhas, report_path
+        return report.get("status_final", "ERROR_SINGLE_PROPERTY_CYCLE"), ([item] if item else []), restaurados, falhas, report_path
 
 
 # =============================================================================
@@ -3559,7 +3799,7 @@ def _tentar_rollback_se_necessario(imoveis_processados, ts_str):
     # Prioriza lista em memória; fallback para checkpoint em disco
     desmarcados = imoveis_processados or _checkpoint_carregar_desmarcados()
     if not desmarcados:
-        return
+        return {"executado": False, "revertidos": [], "pendentes": [], "status": "NO_ROLLBACK_NEEDED"}
 
     print(f"\n⚠️  {len(desmarcados)} imóvel(is) foram desmarcados antes do erro.")
     revertidos, pendentes = _rollback_automatico(desmarcados)
@@ -3572,6 +3812,13 @@ def _tentar_rollback_se_necessario(imoveis_processados, ts_str):
         for item in pendentes:
             print(f"      -> {item['codigo']} | {item.get('categoria_nome','?')} ({item.get('categoria_portal', item.get('categoria_vivareal','?'))})")
         _checkpoint_fechar("ERROR_AFTER_MUTATION_ROLLBACK_PENDING")
+        return {
+            "executado": True,
+            "revertidos": revertidos,
+            "pendentes": pendentes,
+            "status": "ROLLBACK_PENDING",
+            "arquivo": arquivo,
+        }
     else:
         print(f"✅ Rollback concluído: {len(revertidos)} imóvel(is) restaurados.")
         try:
@@ -3580,6 +3827,13 @@ def _tentar_rollback_se_necessario(imoveis_processados, ts_str):
         except Exception as exc:
             print(f"⚠️ Sync ZAP pós-rollback falhou: {exc}")
         _checkpoint_fechar("ERROR_AFTER_MUTATION_ROLLBACK_OK")
+        return {
+            "executado": True,
+            "revertidos": revertidos,
+            "pendentes": [],
+            "status": "ROLLBACK_OK",
+            "arquivo": None,
+        }
 
 
 def _imprimir_resumo(status, encontrados, restaurados, falhas, falhas_lista,
@@ -4013,6 +4267,7 @@ def main():
     restaurados_parte2  = []
     falhas_parte2       = []
     arquivo_rollback    = None
+    resultado_intermediaria = None
 
     driver = _iniciar_chrome_com_retry(options, usando_headless)
     wait = WebDriverWait(driver, 30)
@@ -4046,7 +4301,11 @@ def main():
         print("✅ Login realizado.")
 
         if SINGLE_PROPERTY_CYCLE_ONLY:
-            status_final, imoveis_processados, restaurados_parte2, falhas_parte2, result_path = run_single_property_cycle(ARG_CODIGO)
+            status_final, imoveis_processados, restaurados_parte2, falhas_parte2, result_path = run_single_property_cycle(
+                ARG_CODIGO,
+                max_wait_seconds=VERIFICACAO_TIMEOUT_SEGUNDOS,
+                interval_seconds=VERIFICACAO_INTERVALO_SEGUNDOS,
+            )
             _run_state_salvar(status=status_final, imoveis=imoveis_processados)
             print(f"Relatorio da rodada controlada: {result_path}")
             return
@@ -4178,9 +4437,14 @@ def main():
         # =====================================================================
         print("\n🔍 ===== PARTE INTERMEDIÁRIA: verificando remoção no ZAP Imóveis =====")
         print(f"🧾 ETAPA INTERMEDIÁRIA ({run_id}) verificando {len(imoveis_processados)} imóvel(is) da execução atual.")
-        removidos_confirmados = verify_properties_removed_from_zap(imoveis_processados)
-        if not removidos_confirmados:
-            raise Exception("Parte 2 bloqueada: remoção no ZAP não foi confirmada.")
+        resultado_intermediaria = verify_properties_removed_from_zap(
+            imoveis_processados,
+            modo="producao",
+            return_details=True,
+        )
+        removidos_confirmados = resultado_intermediaria.get("removed_confirmed") is True
+        if removidos_confirmados is not True:
+            raise RuntimeError("Etapa 2 bloqueada: imóveis ainda ativos no Canal Pro.")
         _run_state_salvar(status="PARTE_INTERMEDIARIA_CONFIRMADA", imoveis=imoveis_processados)
 
         # =====================================================================
@@ -4188,6 +4452,7 @@ def main():
         # =====================================================================
         print(f"\n🚧 ===== PARTE 2: restaurando {portal_target_label()} =====")
         print(f"🧾 ETAPA 2 ({run_id}) remarcará somente códigos da ETAPA 1: {[str(i.get('codigo','')).strip() for i in imoveis_processados]}")
+        _update_json_file(resultado_intermediaria.get("report_path"), etapa2_executada=True)
         restaurados_parte2, falhas_parte2 = process_part_2_restore_vivareal(imoveis_processados)
 
         print(f"🚀 Atualizando {portal_target_label()} após Parte 2...")
@@ -4197,7 +4462,19 @@ def main():
             arquivo_rollback = _gerar_arquivo_rollback_pendente(falhas_parte2, ts_str)
             status_final = "ERROR_AFTER_MUTATION_ROLLBACK_PENDING"
             _run_state_salvar(status=status_final, imoveis=imoveis_processados)
+            _update_json_file(
+                resultado_intermediaria.get("report_path"),
+                status_final=status_final,
+                etapa2_executada=True,
+                rollback_executado=False,
+            )
         else:
+            _update_json_file(
+                resultado_intermediaria.get("report_path"),
+                status_final="SUCCESS_ETAPA2_EXECUTADA",
+                etapa2_executada=True,
+                rollback_executado=False,
+            )
             status_final = "SUCCESS"
             _checkpoint_fechar("SUCCESS")
             _run_state_salvar(status="SUCCESS", imoveis=imoveis_processados)
@@ -4221,9 +4498,29 @@ def main():
 
     except TimeoutError as exc:
         print(f"\n⛔ {exc}")
-        status_final = "ERROR_TIMEOUT"
+        msg_timeout = str(exc)
+        status_final = "ERROR_TIMEOUT_INTERMEDIARIA" if "ERROR_TIMEOUT_INTERMEDIARIA" in msg_timeout else "ERROR_TIMEOUT"
         _run_state_salvar(status=status_final, imoveis=imoveis_processados)
-        _tentar_rollback_se_necessario(imoveis_processados, ts_str)
+        rollback_info = _tentar_rollback_se_necessario(imoveis_processados, ts_str)
+        if rollback_info and rollback_info.get("executado"):
+            if rollback_info.get("pendentes"):
+                status_final = "ERROR_TIMEOUT_ROLLBACK_PENDING"
+            else:
+                status_final = "ERROR_TIMEOUT_ROLLBACK"
+            _run_state_salvar(status=status_final, imoveis=imoveis_processados)
+        report_path_timeout = (
+            (resultado_intermediaria or {}).get("report_path")
+            or getattr(exc, "report_path", None)
+        )
+        if report_path_timeout:
+            _update_json_file(
+                report_path_timeout,
+                status_final=status_final,
+                removed_confirmed=False,
+                timeout_reached=True,
+                etapa2_executada=False,
+                rollback_executado=bool(rollback_info and rollback_info.get("executado")),
+            )
 
     except Exception as exc:
         msg = str(exc)
