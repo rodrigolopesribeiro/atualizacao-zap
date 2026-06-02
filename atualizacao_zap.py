@@ -176,8 +176,14 @@ wait = None
 actions = None
 HEALTHCHECK_ONLY = "--healthcheck" in sys.argv
 TEST_CANAL_PRO_LOGIN_ONLY = "--test-canal-pro-login" in sys.argv
-AUDIT_PORTAL_UPDATE_ONLY = "--audit-portal-update" in sys.argv
-AUDIT_PROPERTY_PORTAL_ONLY = "--audit-property-portal" in sys.argv
+AUDIT_PORTAL_UPDATE_ONLY = (
+    "--audit-portal-update" in sys.argv
+    or os.getenv("AUDIT_PORTAL_UPDATE_ONLY", "false").lower() == "true"
+)
+AUDIT_PROPERTY_PORTAL_ONLY = (
+    "--audit-property-portal" in sys.argv
+    or os.getenv("AUDIT_PROPERTY_PORTAL_ONLY", "false").lower() == "true"
+)
 AUDIT_CLICK_UPDATE = "--audit-click-update" in sys.argv or os.getenv("AUDIT_CLICK_UPDATE", "false").lower() == "true"
 RESTORE_ROLLBACK_ONLY = "--restore-rollback" in sys.argv
 SINGLE_PROPERTY_CYCLE_ONLY = "--single-property-cycle" in sys.argv
@@ -3874,8 +3880,11 @@ def _imprimir_resumo(status, encontrados, restaurados, falhas, falhas_lista,
         print("  Códigos com falha:")
         for item in falhas_lista:
             print(f"    → {item['codigo']} | {item.get('categoria_nome','?')}")
+    status_upper = (status or "").upper()
     if status == "SUCCESS":
         print("\n✅ Execução concluída com SUCESSO.")
+    elif status_upper.endswith("_OK") or status_upper.startswith("AUDIT_"):
+        print(f"\n✅ Execução segura concluída: {status}.")
     elif status in ("SKIPPED_NO_ITEMS", "DRY_RUN"):
         print(f"\nℹ️  Execução encerrada: {status} (nenhuma alteração feita).")
     else:
@@ -4392,6 +4401,9 @@ def main():
             # =====================================================================
             # FLUXO NORMAL: executa Parte 1
             # =====================================================================
+            if AUDIT_PORTAL_UPDATE_ONLY or AUDIT_PROPERTY_PORTAL_ONLY or TEST_CANAL_PRO_LOGIN_ONLY or HEALTHCHECK_ONLY:
+                raise RuntimeError("Modo seguro bloqueado antes da Parte 1: auditoria/teste nao pode executar mutacoes.")
+
             if not go_to_imoveis_page_fresh():
                 status_final = "ERROR_BEFORE_MUTATION"
                 raise Exception("Não foi possível abrir Imóveis para iniciar a Parte 1.")
