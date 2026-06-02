@@ -56,6 +56,21 @@ def _arg_float(name, default):
         raise ValueError(f"Valor invalido para {name}: {raw!r}")
 
 
+def _arg_optional_float(name, default=None):
+    raw = _arg_value(name)
+    if raw is None:
+        raw = os.getenv(name.lstrip("-").upper().replace("-", "_"), default)
+    if raw is None or str(raw).strip() == "":
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        raise ValueError(f"Valor invalido para {name}: {raw!r}")
+    if value <= 0:
+        return None
+    return value
+
+
 def _positive_seconds_from_hours(hours, name):
     if hours <= 0:
         raise ValueError(f"{name} deve ser maior que zero.")
@@ -102,12 +117,14 @@ GMAIL_DESTINATARIO     = "mkmarcoslopes@gmail.com"
 CANAL_PRO_URL_LOGIN    = "https://canalpro.grupozap.com/login"
 CANAL_PRO_URL_LISTINGS = "https://canalpro.grupozap.com/ZAP_OLX/0/listings"
 VERIFICACAO_INTERVALO_MINUTOS = _arg_float("--interval-minutes", os.getenv("INTERVAL_MINUTES", "30"))
-VERIFICACAO_MAX_WAIT_HOURS = _arg_float("--max-wait-hours", os.getenv("MAX_WAIT_HOURS", "8"))
+VERIFICACAO_MAX_WAIT_HOURS = _arg_optional_float("--max-wait-hours", os.getenv("MAX_WAIT_HOURS"))
 VERIFICACAO_INTERVALO_SEGUNDOS = _positive_seconds_from_minutes(
     VERIFICACAO_INTERVALO_MINUTOS, "--interval-minutes"
 )
-VERIFICACAO_TIMEOUT_SEGUNDOS = _positive_seconds_from_hours(
-    VERIFICACAO_MAX_WAIT_HOURS, "--max-wait-hours"
+VERIFICACAO_TIMEOUT_SEGUNDOS = (
+    _positive_seconds_from_hours(VERIFICACAO_MAX_WAIT_HOURS, "--max-wait-hours")
+    if VERIFICACAO_MAX_WAIT_HOURS is not None
+    else None
 )
 MINIMO_CODIGOS_ESPERADOS_CANAL_PRO = 10
 MAX_ERROS_CONSECUTIVOS_SCRAPING = 5
@@ -1218,6 +1235,8 @@ def _run_state_salvar(status, imoveis=None):
 
 
 def _formatar_duracao(segundos):
+    if segundos is None:
+        return "sem limite"
     segundos = max(0, int(segundos))
     horas, resto = divmod(segundos, 3600)
     minutos, seg = divmod(resto, 60)
@@ -3074,14 +3093,15 @@ def verify_properties_removed_from_zap(
     Parte Intermediária: abre o Canal Pro em nova aba e verifica a cada
     VERIFICACAO_INTERVALO_SEGUNDOS se os imóveis da Parte 1 foram removidos
     dos anúncios ativos. Só avança quando TODOS estiverem removidos.
-    Timeout máximo: VERIFICACAO_TIMEOUT_SEGUNDOS.
+    Por padrão, não há timeout por relógio; um limite só existe se
+    --max-wait-hours ou MAX_WAIT_HOURS forem definidos explicitamente.
     """
     if not imoveis_processados:
         raise Exception("ETAPA INTERMEDIÁRIA sem imóveis da ETAPA 1 da execução atual. Parte 2 bloqueada.")
 
-    max_wait_seconds = int(max_wait_seconds or VERIFICACAO_TIMEOUT_SEGUNDOS)
+    max_wait_seconds = int(max_wait_seconds) if max_wait_seconds is not None else VERIFICACAO_TIMEOUT_SEGUNDOS
     interval_seconds = int(interval_seconds or VERIFICACAO_INTERVALO_SEGUNDOS)
-    max_wait_hours = round(max_wait_seconds / 3600, 4)
+    max_wait_hours = round(max_wait_seconds / 3600, 4) if max_wait_seconds is not None else None
     interval_minutes = round(interval_seconds / 60, 4)
     codigos_alvo = {str(item["codigo"]).strip() for item in imoveis_processados}
     report_path = report_path or _logs_json_path("parte_intermediaria")
@@ -3131,7 +3151,7 @@ def verify_properties_removed_from_zap(
         while True:
             # Verifica timeout
             elapsed = time.time() - inicio
-            if elapsed > max_wait_seconds:
+            if max_wait_seconds is not None and elapsed > max_wait_seconds:
                 salvar_report(
                     verificacoes_realizadas=max(0, tentativa - 1),
                     removed_confirmed=False,
@@ -3564,7 +3584,7 @@ def run_single_property_cycle(codigo, max_wait_seconds=None, interval_seconds=No
         )
 
     report_path = _single_cycle_report_path(codigo)
-    max_wait_seconds = int(max_wait_seconds or VERIFICACAO_TIMEOUT_SEGUNDOS)
+    max_wait_seconds = int(max_wait_seconds) if max_wait_seconds is not None else VERIFICACAO_TIMEOUT_SEGUNDOS
     interval_seconds = int(interval_seconds or VERIFICACAO_INTERVALO_SEGUNDOS)
     report = {
         "timestamp": datetime.now().isoformat(),
@@ -3580,7 +3600,7 @@ def run_single_property_cycle(codigo, max_wait_seconds=None, interval_seconds=No
         "status": "IN_PROGRESS",
         "status_final": "IN_PROGRESS",
         "verificacoes_realizadas": 0,
-        "max_wait_hours": round(max_wait_seconds / 3600, 4),
+        "max_wait_hours": round(max_wait_seconds / 3600, 4) if max_wait_seconds is not None else None,
         "interval_minutes": round(interval_seconds / 60, 4),
         "removed_confirmed": False,
         "timeout_reached": False,
