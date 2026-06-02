@@ -128,6 +128,9 @@ VERIFICACAO_TIMEOUT_SEGUNDOS = (
 )
 MINIMO_CODIGOS_ESPERADOS_CANAL_PRO = 10
 MAX_ERROS_CONSECUTIVOS_SCRAPING = 5
+ALERTA_EXECUCAO_LONGA_HORAS = 12
+ALERTA_EXECUCAO_CRITICA_HORAS = 24
+JANELA_SEM_PROGRESSO_VERIFICACOES = 20
 # Aliases para compatibilidade
 CANALPRO_LOGIN_URL = CANAL_PRO_URL_LOGIN
 CANALPRO_LISTINGS_BASE_URL = CANAL_PRO_URL_LISTINGS
@@ -2977,6 +2980,30 @@ def _deve_abortar_por_erros_consecutivos(erros_consecutivos, max_erros=MAX_ERROS
     return erros_consecutivos >= max_erros
 
 
+def _calcular_status_operacional_intermediaria(elapsed_seconds, sem_progresso=False):
+    if elapsed_seconds >= ALERTA_EXECUCAO_CRITICA_HORAS * 3600:
+        return "WAITING_REMOVAL_CRITICAL"
+    if sem_progresso:
+        return "WAITING_REMOVAL_NO_PROGRESS"
+    if elapsed_seconds >= ALERTA_EXECUCAO_LONGA_HORAS * 3600:
+        return "WAITING_REMOVAL_LONG_RUNNING"
+    return "WAITING_REMOVAL"
+
+
+def _ultimas_verificacoes_sem_progresso(verificacoes, janela=JANELA_SEM_PROGRESSO_VERIFICACOES):
+    if len(verificacoes) < janela:
+        return False
+    ultimas = verificacoes[-janela:]
+    pendentes_ref = ultimas[0].get("pendentes")
+    removidos_ref = ultimas[0].get("removidos")
+    if not pendentes_ref:
+        return False
+    return all(
+        item.get("pendentes") == pendentes_ref and item.get("removidos") == removidos_ref
+        for item in ultimas
+    )
+
+
 def _test_canal_pro_login_flow():
     print("🧪 TESTE SEGURO: login Canal Pro + Anúncios, sem alterar imóveis.")
     aba_origem = _canal_pro_login()
@@ -3076,6 +3103,16 @@ def _selftest_parte_intermediaria():
     )
     assert c4["todos_removidos"] is True and c4["erro_scraping"] is False
 
+    assert _calcular_status_operacional_intermediaria(1) == "WAITING_REMOVAL"
+    assert _calcular_status_operacional_intermediaria(12 * 3600) == "WAITING_REMOVAL_LONG_RUNNING"
+    assert _calcular_status_operacional_intermediaria(24 * 3600) == "WAITING_REMOVAL_CRITICAL"
+    assert _calcular_status_operacional_intermediaria(1, sem_progresso=True) == "WAITING_REMOVAL_NO_PROGRESS"
+    historico_sem_progresso = [
+        {"pendentes": ["1018"], "removidos": ["1146"]}
+        for _ in range(JANELA_SEM_PROGRESSO_VERIFICACOES)
+    ]
+    assert _ultimas_verificacoes_sem_progresso(historico_sem_progresso) is True
+
     erros = 0
     abortou = False
     for _ in range(5):
@@ -3126,6 +3163,9 @@ def verify_properties_removed_from_zap(
         "rollback_executado": False,
         "pending_codes_final": sorted(codigos_alvo),
         "status_final": "IN_PROGRESS",
+        "status_operacional": "WAITING_REMOVAL",
+        "alertas_operacionais": [],
+        "no_progress_window": JANELA_SEM_PROGRESSO_VERIFICACOES,
         "verificacoes": [],
     }
 
@@ -3150,6 +3190,7 @@ def verify_properties_removed_from_zap(
     inicio = time.time()
     tentativa = 1
     ultimo_ainda_ativos = set(codigos_alvo)
+    alertas_emitidos = set()
 
     try:
         erros_consecutivos = 0
@@ -3272,7 +3313,7 @@ def verify_properties_removed_from_zap(
             ainda_ativos = avaliacao["ainda_ativos"]
             ja_removidos = codigos_alvo - ativos
             ultimo_ainda_ativos = set(ainda_ativos)
-            report["verificacoes"].append({
+            verificacao_entry = {
                 "numero": tentativa,
                 "horario": horario,
                 "tempo_decorrido_segundos": int(elapsed),
@@ -3283,12 +3324,45 @@ def verify_properties_removed_from_zap(
                 "pendentes": sorted(ainda_ativos),
                 "removidos": sorted(ja_removidos),
                 "resultado": "todos_removidos" if not ainda_ativos else "aguardando_proxima_verificacao",
-            })
+            }
+            report["verificacoes"].append(verificacao_entry)
+            sem_progresso = _ultimas_verificacoes_sem_progresso(report["verificacoes"])
+            status_operacional = _calcular_status_operacional_intermediaria(
+                elapsed,
+                sem_progresso=sem_progresso,
+            )
+            verificacao_entry["status_operacional"] = status_operacional
+            verificacao_entry["sem_progresso"] = sem_progresso
+            novos_alertas = []
+            if status_operacional == "WAITING_REMOVAL_LONG_RUNNING" and "LONG_RUNNING" not in alertas_emitidos:
+                novos_alertas.append(
+                    f"ALERTA: Parte Intermediaria aguardando ha {_formatar_duracao(elapsed)}; "
+                    f"pendentes={sorted(ainda_ativos)}"
+                )
+                alertas_emitidos.add("LONG_RUNNING")
+            if status_operacional == "WAITING_REMOVAL_CRITICAL" and "CRITICAL" not in alertas_emitidos:
+                novos_alertas.append(
+                    f"ALERTA CRITICO: Parte Intermediaria aguardando ha {_formatar_duracao(elapsed)}; "
+                    f"pendentes={sorted(ainda_ativos)}"
+                )
+                alertas_emitidos.add("CRITICAL")
+            if sem_progresso and "NO_PROGRESS" not in alertas_emitidos:
+                novos_alertas.append(
+                    "ALERTA: Sem progresso detectado nas ultimas "
+                    f"{JANELA_SEM_PROGRESSO_VERIFICACOES} verificacoes; pendentes={sorted(ainda_ativos)}"
+                )
+                alertas_emitidos.add("NO_PROGRESS")
+            if novos_alertas:
+                report["alertas_operacionais"].extend(novos_alertas)
+                verificacao_entry["alertas_operacionais"] = list(novos_alertas)
+                for alerta in novos_alertas:
+                    print(f"   ⚠️ {alerta}")
             salvar_report(
                 verificacoes_realizadas=tentativa,
                 removed_confirmed=False,
                 pending_codes_final=sorted(ainda_ativos),
-                status_final="IN_PROGRESS",
+                status_final=status_operacional,
+                status_operacional=status_operacional,
             )
 
             if ja_removidos:
@@ -3316,6 +3390,7 @@ def verify_properties_removed_from_zap(
             proxima = datetime.now().strftime("%H:%M:%S")
             print(f"   ⏳ Ainda ativos no ZAP ({len(ainda_ativos)} imóvel(is)): {sorted(ainda_ativos)}")
             print(f"   ✅ Removidos: {len(ja_removidos)} | Pendentes: {len(ainda_ativos)}")
+            print(f"   🧭 Status operacional: {status_operacional}")
             print(f"   ⏱️ Próxima verificação em {_formatar_duracao(interval_seconds)}... [{proxima}]")
             time.sleep(interval_seconds)
             tentativa += 1
