@@ -947,6 +947,7 @@ def search_property_by_code_strict(codigo, max_attempts=3):
 
 
 def edit_property_result_by_code(codigo):
+    codigo = str(codigo).strip()
     try:
         row = wait.until(
             EC.presence_of_element_located(
@@ -961,24 +962,45 @@ def edit_property_result_by_code(codigo):
         safe_click(edit_btn)
 
     except Exception:
-        print(f"⚠️ Não achei linha exata do código {codigo}. Tentando fallback com primeiro botão editar após confirmação.")
+        print(f"Nao achei linha exata do codigo {codigo}. Validando botoes editar um por um.")
         buttons = wait.until(
             EC.presence_of_all_elements_located((By.XPATH, "//button[contains(@onclick,'mdImovelUpdate')]"))
         )
-        if not buttons:
-            raise Exception(f"Nenhum botão editar encontrado para código {codigo}")
-        safe_click(buttons[0])
+        total = len(buttons)
+        if not total:
+            raise Exception(f"Nenhum botao editar encontrado para codigo {codigo}")
+
+        for idx in range(total):
+            try:
+                buttons = wait.until(
+                    EC.presence_of_all_elements_located((By.XPATH, "//button[contains(@onclick,'mdImovelUpdate')]"))
+                )
+                if idx >= len(buttons):
+                    break
+                safe_click(buttons[idx])
+                wait.until(EC.visibility_of_element_located((By.ID, "titulo-input")))
+                time.sleep(1)
+                codigo_modal = get_property_code_from_modal()
+                if str(codigo_modal).strip().upper() == codigo.upper():
+                    print(f"Modal correto aberto para codigo {codigo}.")
+                    return
+                print(f"Fallback abriu {codigo_modal}, esperado {codigo}. Fechando e tentando proximo.")
+                close_any_open_modal()
+                time.sleep(0.8)
+            except Exception as exc:
+                close_any_open_modal()
+                print(f"Falha ao validar botao editar #{idx+1}/{total}: {type(exc).__name__} | {repr(exc)}")
+        raise Exception(f"Nao consegui abrir o imovel correto {codigo} apos validar {total} botao(oes) editar.")
 
     wait.until(EC.visibility_of_element_located((By.ID, "titulo-input")))
     time.sleep(1)
 
     codigo_modal = get_property_code_from_modal()
-    if str(codigo_modal).strip().upper() != str(codigo).strip().upper():
+    if str(codigo_modal).strip().upper() != codigo.upper():
         close_any_open_modal()
-        raise Exception(f"Imóvel errado aberto. Esperado {codigo}, abriu {codigo_modal}")
+        raise Exception(f"Imovel errado aberto. Esperado {codigo}, abriu {codigo_modal}")
 
-    print(f"✏️ Modal correto aberto para código {codigo}.")
-
+    print(f"Modal correto aberto para codigo {codigo}.")
 
 def _normalize_portal_id(value):
     return str(value or "").strip().strip('"').strip("'")
