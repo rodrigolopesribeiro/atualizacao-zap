@@ -179,6 +179,7 @@ wait = None
 actions = None
 HEALTHCHECK_ONLY = "--healthcheck" in sys.argv
 TEST_CANAL_PRO_LOGIN_ONLY = "--test-canal-pro-login" in sys.argv
+AUDIT_CANAL_PRO_STATUS_ONLY = "--audit-canal-pro-status" in sys.argv
 AUDIT_PORTAL_UPDATE_ONLY = (
     "--audit-portal-update" in sys.argv
     or os.getenv("AUDIT_PORTAL_UPDATE_ONLY", "false").lower() == "true"
@@ -190,10 +191,25 @@ AUDIT_PROPERTY_PORTAL_ONLY = (
 AUDIT_CLICK_UPDATE = "--audit-click-update" in sys.argv or os.getenv("AUDIT_CLICK_UPDATE", "false").lower() == "true"
 RESTORE_ROLLBACK_ONLY = "--restore-rollback" in sys.argv
 SINGLE_PROPERTY_CYCLE_ONLY = "--single-property-cycle" in sys.argv
+RUN_CODES_ONLY = "--run-codes" in sys.argv
+CONFIRM_PRODUCTION = "--confirm-production" in sys.argv
 ARG_CODIGO = _arg_value("--codigo")
+ARG_CODES = _arg_value("--codes")
+ARG_RUN_CODES = _arg_value("--run-codes")
 ARG_PORTAL_ID = _arg_value("--portal-id")
 ARG_ROLLBACK_FILE = _arg_value("--restore-rollback")
 NO_SYNC_AFTER_RESTORE = "--no-sync-after-restore" in sys.argv
+
+
+def _parse_codes_arg(raw):
+    if not raw:
+        return []
+    codes = []
+    for part in re.split(r"[,;\s]+", str(raw)):
+        code = part.strip()
+        if code:
+            codes.append(code)
+    return list(dict.fromkeys(codes))
 
 
 # =============================================================================
@@ -996,11 +1012,80 @@ def find_target_portal_update_button(portal_id=None, portal_name=None, portal_fi
     raise Exception(f"Botao updatePortais nao encontrado para {portal_target_label(portal_id, portal_name, portal_file)}")
 
 
-def go_to_integracoes_parceiros_and_update_target_portal(portal_id=None, portal_name=None, portal_file=None):
+def _collect_browser_console_logs():
+    entries = []
+    try:
+        for item in driver.get_log("browser"):
+            entries.append({
+                "level": item.get("level"),
+                "message": item.get("message"),
+                "timestamp": item.get("timestamp"),
+            })
+    except Exception as exc:
+        entries.append({"error": f"{type(exc).__name__}: {exc}"})
+    return entries
+
+
+def _collect_visible_feedback_texts():
+    selectors = [
+        ".toast",
+        ".toast-container",
+        ".alert",
+        ".swal2-container",
+        ".modal",
+        "[role='alert']",
+        ".notification",
+        ".notify",
+    ]
+    texts = []
+    seen = set()
+    for sel in selectors:
+        for el in driver.find_elements(By.CSS_SELECTOR, sel):
+            try:
+                txt = (el.text or "").strip()
+                if txt and txt not in seen:
+                    seen.add(txt)
+                    texts.append(txt[:1000])
+            except Exception:
+                pass
+    return texts
+
+
+def _update_portal_report_path(stage):
+    os.makedirs("logs", exist_ok=True)
+    run_id = _RUN_CONTEXT.get("run_id") or datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_stage = re.sub(r"[^0-9A-Za-z_-]+", "_", str(stage or "update"))
+    return os.path.join("logs", f"update_portal_{run_id}_{safe_stage}.json")
+
+
+def _write_update_portal_report(path, report):
+    report["updated_at"] = datetime.now().isoformat()
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(report, f, ensure_ascii=False, indent=2)
+
+
+def go_to_integracoes_parceiros_and_update_target_portal(
+        portal_id=None,
+        portal_name=None,
+        portal_file=None,
+        evidence_stage=None,
+        monitor_seconds=15,
+        require_evidence=False):
     if portal_id is None:
         portal = require_portal_target_config()
         portal_id, portal_name, portal_file = portal["id"], portal["name"], portal["file"]
     label = portal_target_label(portal_id, portal_name, portal_file)
+    report_path = _update_portal_report_path(evidence_stage or f"update_{portal_id}")
+    report = {
+        "timestamp": datetime.now().isoformat(),
+        "run_id": _RUN_CONTEXT.get("run_id"),
+        "portal": {"id": str(portal_id), "name": portal_name, "file": portal_file, "label": label},
+        "monitor_seconds": monitor_seconds,
+        "require_evidence": require_evidence,
+        "accepted": False,
+        "evidence": [],
+        "errors": [],
+    }
     expand_menu_if_needed()
     try:
         a_integracoes = wait.until(EC.element_to_be_clickable((By.XPATH, "//a[.//i[contains(@class,'fa-plug')] and contains(normalize-space(.),'Integra')]")))
@@ -1017,11 +1102,50 @@ def go_to_integracoes_parceiros_and_update_target_portal(portal_id=None, portal_
         driver.get("https://www.rioorla.com.br/crm/po.php")
         time.sleep(2)
     btn = wait.until(lambda _driver: find_target_portal_update_button(portal_id, portal_name, portal_file))
+    report["button_before"] = _portal_button_summary(btn)
+    report["feedback_before"] = _collect_visible_feedback_texts()
+    report["network_before"] = _collect_browser_network_logs()
     print(f"Atualizando portal alvo: {label}")
     print(f"Botao encontrado: {_portal_button_summary(btn)}")
     safe_click(btn)
+    report["clicked_at"] = datetime.now().isoformat()
     print(f"Atualizacao do {label} disparada.")
-    time.sleep(5)
+    time.sleep(max(1, int(monitor_seconds or 0)))
+    report["current_url_after_click"] = driver.current_url
+    report["title_after_click"] = driver.title
+    report["feedback_after"] = _collect_visible_feedback_texts()
+    report["network_after"] = _collect_browser_network_logs()
+    report["browser_console_after"] = _collect_browser_console_logs()
+    try:
+        report["button_after"] = _portal_button_summary(find_target_portal_update_button(portal_id, portal_name, portal_file))
+    except Exception as exc:
+        report["errors"].append(f"button_after: {type(exc).__name__}: {exc}")
+    try:
+        report["snapshot_after_click"] = save_debug_snapshot(driver, f"update_portal_{portal_id}_{evidence_stage or 'after_click'}")
+    except Exception as exc:
+        report["errors"].append(f"snapshot_after_click: {type(exc).__name__}: {exc}")
+
+    network_after = report.get("network_after") or []
+    feedback_after = report.get("feedback_after") or []
+    response_events = [
+        item for item in network_after
+        if item.get("method") == "Network.responseReceived" and item.get("status")
+    ]
+    if response_events:
+        report["evidence"].append("network_response_after_click")
+    if feedback_after:
+        report["evidence"].append("visible_feedback_after_click")
+    if report.get("button_after"):
+        report["evidence"].append("button_still_present_after_click")
+    report["accepted"] = bool(report["evidence"])
+    _write_update_portal_report(report_path, report)
+    print(f"Relatorio de atualizacao do portal: {report_path}")
+    if require_evidence and not report["accepted"]:
+        raise Exception(
+            f"Atualizacao do {label} sem evidencia operacional suficiente. "
+            f"Relatorio: {report_path}"
+        )
+    return report_path
 
 
 def go_to_integracoes_parceiros_and_update_vivareal():
@@ -2954,6 +3078,204 @@ def _canal_pro_collect_all_active_codes(ultimo_total_valido=0):
     }
 
 
+def _extract_canal_pro_cards_status(page, out_dir=None, target_codes=None):
+    target_codes = {str(c) for c in (target_codes or [])}
+    selectors = [
+        ".list__card-content-v2",
+        ".listing-card-v2",
+        "[data-testid='listing-item']",
+        "div[class*='listing-item']",
+    ]
+    cards = []
+    seen_elements = set()
+    for sel in selectors:
+        for el in driver.find_elements(By.CSS_SELECTOR, sel):
+            try:
+                element_id = el.id
+            except Exception:
+                element_id = None
+            if element_id and element_id in seen_elements:
+                continue
+            if element_id:
+                seen_elements.add(element_id)
+            try:
+                text = (el.text or "").strip()
+                html = (el.get_attribute("outerHTML") or "")
+            except Exception:
+                continue
+            if not text and not html:
+                continue
+
+            code = ""
+            for css in [".card-content__tag", "[data-testid='listing-code-label']", "img[alt]"]:
+                try:
+                    sub = el.find_elements(By.CSS_SELECTOR, css)
+                    for item in sub:
+                        raw = (item.text or item.get_attribute("alt") or "").strip()
+                        m = re.search(r"\b\d{2,6}[A-Za-z]?\b", raw)
+                        if m:
+                            code = m.group(0)
+                            break
+                    if code:
+                        break
+                except Exception:
+                    pass
+            if not code:
+                m = re.search(r"\b\d{2,6}[A-Za-z]?\b", text)
+                if m:
+                    code = m.group(0)
+
+            lower = text.lower()
+            alerta = ""
+            if "identificamos que este an" in lower and "duplicado" in lower:
+                alerta = "Identificamos que este anuncio esta duplicado em sua conta"
+            elif "duplicado" in lower:
+                alerta = "duplicado"
+            elif "bloqueado" in lower:
+                alerta = "bloqueado"
+
+            status_visual = "outro"
+            classificacao = "outro"
+            if "bloqueado" in lower and "duplicado" in lower:
+                status_visual = "bloqueado"
+                classificacao = "bloqueado por duplicidade"
+            elif "bloqueado" in lower:
+                status_visual = "bloqueado"
+                classificacao = "bloqueado"
+            elif "pausado" in lower:
+                status_visual = "pausado"
+                classificacao = "outro"
+            elif "inativo" in lower:
+                status_visual = "inativo"
+                classificacao = "outro"
+            elif "pendente" in lower:
+                status_visual = "pendente"
+                classificacao = "outro"
+            elif any(term in lower for term in ["publicado", "via integra", "venda", "aluguel"]):
+                status_visual = "ativo"
+                classificacao = "ativo normal"
+
+            criado_em = ""
+            atualizado_em = ""
+            m_criado = re.search(r"Criado em\s*([0-9/:\s]+)", text, flags=re.IGNORECASE)
+            if m_criado:
+                criado_em = m_criado.group(1).strip()
+            m_atualizado = re.search(r"Atualizado em\s*([0-9/:\s]+)", text, flags=re.IGNORECASE)
+            if m_atualizado:
+                atualizado_em = m_atualizado.group(1).strip()
+
+            score = ""
+            score_match = re.search(r"\b([0-9]\.[0-9]|10(?:\.0)?)\b", text)
+            if score_match:
+                score = score_match.group(1)
+
+            screenshot_path = ""
+            if out_dir and (not target_codes or code in target_codes):
+                try:
+                    cards_dir = os.path.join(out_dir, "cards")
+                    os.makedirs(cards_dir, exist_ok=True)
+                    safe_code = re.sub(r"[^0-9A-Za-z_-]+", "_", code or f"sem_codigo_{len(cards)+1}")
+                    screenshot_path = os.path.join(cards_dir, f"page{page}_{safe_code}.png")
+                    el.screenshot(screenshot_path)
+                except Exception:
+                    screenshot_path = ""
+
+            cards.append({
+                "codigo": code,
+                "pagina": page,
+                "status_visual": status_visual,
+                "classificacao": classificacao,
+                "alerta": alerta,
+                "duplicado": "duplicado" in lower,
+                "bloqueado": "bloqueado" in lower,
+                "criado_em": criado_em,
+                "atualizado_em": atualizado_em,
+                "score": score,
+                "texto": text[:2000],
+                "html": html[:6000],
+                "screenshot": screenshot_path,
+            })
+    return cards
+
+
+def audit_canal_pro_status(codes):
+    codes = [str(c) for c in codes if str(c).strip()]
+    if not codes:
+        raise Exception("Use --audit-canal-pro-status --codes COD1,COD2")
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_id = _RUN_CONTEXT.get("run_id") or ts
+    out_dir = os.path.join("debug", f"{ts}_audit_canal_pro_status")
+    os.makedirs(out_dir, exist_ok=True)
+    report_path = os.path.join("logs", f"canal_pro_status_{run_id}.json")
+    os.makedirs("logs", exist_ok=True)
+    report = {
+        "timestamp": datetime.now().isoformat(),
+        "run_id": run_id,
+        "safe_mode": True,
+        "codes_requested": codes,
+        "cards": [],
+        "por_codigo": {},
+        "total_cards_scanned": 0,
+        "pages_scanned": 0,
+        "snapshots": [],
+    }
+
+    _canal_pro_login()
+    _canal_pro_navigate_to_listings()
+    _canal_pro_ir_para_pagina_1()
+    target_set = set(codes)
+    page = 1
+    while True:
+        try:
+            WebDriverWait(driver, 12).until(
+                lambda d: "Criado em" in d.page_source
+                or len(d.find_elements(By.CSS_SELECTOR, ".list__card-content-v2, .listing-card-v2, [data-testid='listing-item']")) > 0
+                or _canal_pro_lista_vazia_confirmada()[0]
+            )
+        except Exception:
+            pass
+        report["snapshots"].append(save_debug_snapshot(driver, f"audit_canal_pro_status_page_{page}"))
+        cards = _extract_canal_pro_cards_status(page, out_dir=out_dir, target_codes=target_set)
+        print(f"Auditoria Canal Pro pagina {page}: {len(cards)} card(s)")
+        report["cards"].extend(cards)
+        report["pages_scanned"] = page
+        found_now = {c.get("codigo") for c in cards if c.get("codigo") in target_set}
+        if target_set and target_set.issubset({c.get("codigo") for c in report["cards"]}):
+            # Continue only if pagination is already exhausted? No: stop early once all requested codes have evidence.
+            break
+        btn_next, habilitado = _canal_pro_botao_proxima_habilitado()
+        if not habilitado:
+            break
+        safe_click(btn_next)
+        time.sleep(2)
+        page += 1
+
+    report["total_cards_scanned"] = len(report["cards"])
+    for code in codes:
+        matches = [c for c in report["cards"] if c.get("codigo") == code]
+        if not matches:
+            report["por_codigo"][code] = {"codigo": code, "classificacao": "nao encontrado", "matches": []}
+            continue
+        primary = matches[0].copy()
+        if len(matches) > 1 and primary.get("classificacao") == "ativo normal":
+            primary["classificacao"] = "ativo mas sem vinculo"
+            primary["observacao"] = "Codigo apareceu em mais de um card durante a auditoria."
+        primary["matches"] = matches
+        report["por_codigo"][code] = primary
+    report["bloqueados_por_duplicidade"] = [
+        code for code, item in report["por_codigo"].items()
+        if item.get("classificacao") == "bloqueado por duplicidade"
+    ]
+    report["nao_encontrados"] = [
+        code for code, item in report["por_codigo"].items()
+        if item.get("classificacao") == "nao encontrado"
+    ]
+    _write_json_atomic(report_path, report)
+    print(f"Relatorio de status Canal Pro: {report_path}")
+    print(f"Diretorio de evidencias: {out_dir}")
+    return report_path, out_dir
+
+
 def _avaliar_resultado_intermediario(codigos_alvo, resultado_varredura, ultimo_total_valido):
     ativos = set(resultado_varredura.get("codigos_ativos") or set())
     total_atual = int(resultado_varredura.get("total_codigos_ativos", len(ativos)))
@@ -3653,6 +3975,224 @@ def _write_single_cycle_report(path, report):
         json.dump(report, f, ensure_ascii=False, indent=2)
 
 
+def _property_portal_state(codigo):
+    codigo = str(codigo or "").strip()
+    if not codigo:
+        raise Exception("Codigo vazio para auditoria de portal do imovel.")
+    if not search_property_by_code_strict(codigo):
+        raise Exception(f"Nao consegui localizar o imovel {codigo}.")
+    edit_property_result_by_code(codigo)
+    if not open_divulgacao_tab_any():
+        raise Exception(f"Nao consegui abrir Divulgacao para {codigo}.")
+    inputs = driver.find_elements(By.CSS_SELECTOR, "input[data-tipo='portaispagos'][data-portal-check='1']")
+    portal_inputs = [_portal_input_summary(el) for el in inputs]
+    by_id = {str(item.get("raw_value")): item for item in portal_inputs}
+    state = {
+        "codigo": codigo,
+        "portal_inputs": portal_inputs,
+        "target_id": str(PORTAL_TARGET_ID),
+        "target_checked": bool(by_id.get(str(PORTAL_TARGET_ID), {}).get("checked_js")),
+        "vivareal_checked": bool(by_id.get("9", {}).get("checked_js")),
+        "olx_brasil_checked": bool(by_id.get("61", {}).get("checked_js")),
+    }
+    close_any_open_modal()
+    close_known_popup_modals()
+    return state
+
+
+def validate_after_part1(codigos):
+    codigos = [str(c) for c in codigos if str(c).strip()]
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_id = _RUN_CONTEXT.get("run_id") or ts
+    report_path = os.path.join("logs", f"validate_after_part1_{run_id}.json")
+    report = {
+        "timestamp": datetime.now().isoformat(),
+        "run_id": run_id,
+        "portal_target": require_portal_target_config(),
+        "codigos": codigos,
+        "resultados": [],
+        "valid": False,
+        "falhas": [],
+    }
+    for codigo in codigos:
+        try:
+            state = _property_portal_state(codigo)
+            ok = state.get("target_checked") is False
+            state["valid_after_part1"] = ok
+            if not ok:
+                report["falhas"].append({
+                    "codigo": codigo,
+                    "motivo": f"{portal_target_label()} ainda esta marcado apos salvar Parte 1",
+                    "state": state,
+                })
+            report["resultados"].append(state)
+        except Exception as exc:
+            report["falhas"].append({"codigo": codigo, "motivo": f"{type(exc).__name__}: {exc}"})
+    report["valid"] = not report["falhas"]
+    _write_json_atomic(report_path, report)
+    print(f"Validacao pos-Parte 1 salva em: {report_path}")
+    if not report["valid"]:
+        raise Exception(f"Validacao pos-Parte 1 falhou. Relatorio: {report_path}")
+    return report_path
+
+
+def process_part_1_disable_codes(codigos):
+    require_portal_target_config()
+    codigos = [str(c) for c in codigos if str(c).strip()]
+    if not codigos:
+        raise Exception("Lista de codigos vazia para Parte 1 controlada.")
+    imoveis = []
+    for codigo in codigos:
+        print(f"Parte 1 controlada: desmarcando {portal_target_label()} para codigo {codigo}")
+        if not search_property_by_code_strict(codigo):
+            raise Exception(f"Nao consegui localizar o imovel {codigo}.")
+        edit_property_result_by_code(codigo)
+        if not open_divulgacao_tab():
+            raise Exception(f"Nao consegui abrir Divulgacao para {codigo}.")
+        categoria_value, categoria_nome = get_target_portal_category_value()
+        marcado_antes = is_target_portal_checked()
+        if not marcado_antes:
+            close_any_open_modal()
+            raise Exception(f"Imovel {codigo} ja estava desmarcado em {portal_target_label()}.")
+        item = {
+            "codigo": codigo,
+            "portal_id": PORTAL_TARGET_ID,
+            "portal_nome": PORTAL_TARGET_NAME,
+            "portal_arquivo": PORTAL_TARGET_FILE,
+            "categoria_portal": categoria_value,
+            "categoria_vivareal": categoria_value,
+            "categoria_nome": categoria_nome,
+        }
+        set_target_portal_checked(False)
+        save_property()
+        close_known_popup_modals()
+        close_any_open_modal()
+        imoveis.append(item)
+    return imoveis
+
+
+def _run_codes_report_path(codes):
+    os.makedirs("logs", exist_ok=True)
+    safe = "_".join(re.sub(r"[^0-9A-Za-z_-]+", "_", str(c)) for c in codes[:5])
+    if len(codes) > 5:
+        safe += f"_mais_{len(codes)-5}"
+    return os.path.join("logs", f"run_codes_{safe}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
+
+
+def run_codes_cycle(codes):
+    codes = [str(c) for c in codes if str(c).strip()]
+    if not CONFIRM_PRODUCTION:
+        raise Exception("Modo --run-codes bloqueado: inclua --confirm-production para execucao real controlada.")
+    if not codes:
+        raise Exception("Use --run-codes 1493 ou --run-codes 1493,1492")
+    require_portal_target_config()
+    if str(PORTAL_TARGET_ID) != VIVAREAL_VALUE:
+        raise Exception(f"--run-codes bloqueado: portal alvo precisa ser VivaReal/id=9. Atual: {portal_target_label()}")
+
+    report_path = _run_codes_report_path(codes)
+    report = {
+        "timestamp": datetime.now().isoformat(),
+        "run_id": _RUN_CONTEXT.get("run_id"),
+        "modo": "run_codes_controlado",
+        "codes": codes,
+        "status_final": "IN_PROGRESS",
+        "steps": [],
+        "etapa2_executada": False,
+    }
+    _write_json_atomic(report_path, report)
+
+    def step(name, **extra):
+        entry = {"at": datetime.now().isoformat(), "step": name}
+        entry.update(extra)
+        report["steps"].append(entry)
+        _write_json_atomic(report_path, report)
+
+    imoveis = []
+    restaurados = []
+    falhas = []
+    try:
+        step("audit_canal_pro_status_inicio")
+        status_report, status_dir = audit_canal_pro_status(codes)
+        step("audit_canal_pro_status_concluida", report_path=status_report, evidence_dir=status_dir)
+        with open(status_report, "r", encoding="utf-8") as f:
+            status_data = json.load(f)
+        bloqueados = status_data.get("bloqueados_por_duplicidade") or []
+        nao_encontrados = status_data.get("nao_encontrados") or []
+        if bloqueados:
+            raise Exception(f"Execucao bloqueada: codigos bloqueados por duplicidade no Canal Pro: {bloqueados}")
+        if nao_encontrados:
+            raise Exception(f"Execucao bloqueada: codigos nao encontrados no Canal Pro antes do teste: {nao_encontrados}")
+        if driver.window_handles:
+            driver.switch_to.window(driver.window_handles[0])
+
+        step("parte1_inicio")
+        imoveis = process_part_1_disable_codes(codes)
+        step("parte1_concluida", imoveis=imoveis)
+        validate_report = validate_after_part1(codes)
+        step("validacao_pos_parte1_ok", report_path=validate_report)
+
+        update_report = go_to_integracoes_parceiros_and_update_target_portal(
+            VIVAREAL_VALUE,
+            "VivaReal",
+            "vivareal.php",
+            evidence_stage="run_codes_pos_parte1",
+            monitor_seconds=120,
+            require_evidence=True,
+        )
+        step("update_vivareal_pos_parte1_ok", report_path=update_report)
+
+        resultado_intermediaria = verify_properties_removed_from_zap(
+            imoveis,
+            max_wait_seconds=VERIFICACAO_TIMEOUT_SEGUNDOS,
+            interval_seconds=VERIFICACAO_INTERVALO_SEGUNDOS,
+            modo="run_codes_controlado",
+            return_details=True,
+        )
+        step("parte_intermediaria_resultado", resultado=resultado_intermediaria)
+        if resultado_intermediaria.get("removed_confirmed") is not True:
+            raise RuntimeError("Etapa 2 bloqueada: imoveis ainda ativos no Canal Pro.")
+
+        report["etapa2_executada"] = True
+        restaurados, falhas = process_part_2_restore_vivareal(imoveis)
+        step("parte2_concluida", restaurados=restaurados, falhas=falhas)
+        if falhas:
+            raise Exception(f"Falhas na Parte 2 controlada: {[i.get('codigo') for i in falhas]}")
+
+        update_report_2 = go_to_integracoes_parceiros_and_update_target_portal(
+            VIVAREAL_VALUE,
+            "VivaReal",
+            "vivareal.php",
+            evidence_stage="run_codes_pos_parte2",
+            monitor_seconds=120,
+            require_evidence=True,
+        )
+        step("update_vivareal_pos_parte2_ok", report_path=update_report_2)
+        report["status_final"] = "SUCCESS"
+        report["restaurados"] = restaurados
+        report["falhas"] = falhas
+        _write_json_atomic(report_path, report)
+        return "SUCCESS", imoveis, restaurados, falhas, report_path
+    except Exception as exc:
+        report["status_final"] = "ERROR_RUN_CODES"
+        report["error"] = f"{type(exc).__name__}: {exc}"
+        step("erro", error=report["error"])
+        if imoveis and not report.get("etapa2_executada"):
+            report["observacao"] = "Imoveis podem estar desmarcados; restauracao automatica sera tentada."
+            try:
+                restaurados, falhas = process_part_2_restore_vivareal(imoveis)
+                report["safety_restore"] = {"restaurados": restaurados, "falhas": falhas}
+                if restaurados:
+                    try:
+                        restore_update = go_to_integracoes_parceiros_and_update_vivareal()
+                        report["safety_restore_update"] = restore_update
+                    except Exception as sync_exc:
+                        report["safety_restore_update"] = f"{type(sync_exc).__name__}: {sync_exc}"
+            except Exception as rb_exc:
+                report["safety_restore_error"] = f"{type(rb_exc).__name__}: {rb_exc}"
+        _write_json_atomic(report_path, report)
+        return report["status_final"], imoveis, restaurados, falhas, report_path
+
+
 def run_single_property_cycle(codigo, max_wait_seconds=None, interval_seconds=None):
     codigo = str(codigo or "").strip()
     if not codigo:
@@ -4308,7 +4848,7 @@ def main():
         return
 
     options = Options()
-    if AUDIT_PORTAL_UPDATE_ONLY:
+    if AUDIT_PORTAL_UPDATE_ONLY or RUN_CODES_ONLY or SINGLE_PROPERTY_CYCLE_ONLY:
         options.set_capability("goog:loggingPrefs", {"performance": "ALL", "browser": "ALL"})
     options.add_argument("--disable-notifications")
     options.add_argument("--disable-popup-blocking")
@@ -4397,12 +4937,28 @@ def main():
             _run_state_salvar(status=status_final, imoveis=[])
             return
 
+        if AUDIT_CANAL_PRO_STATUS_ONLY:
+            report_path, evidence_dir = audit_canal_pro_status(_parse_codes_arg(ARG_CODES))
+            status_final = "AUDIT_CANAL_PRO_STATUS_OK"
+            _run_state_salvar(status=status_final, imoveis=[])
+            print(f"Auditoria Canal Pro concluida sem executar Parte 1/Parte 2: {report_path}")
+            print(f"Evidencias: {evidence_dir}")
+            return
+
         # --- LOGIN CRM ---
         driver.get(CRM_URL)
         wait.until(EC.visibility_of_element_located((By.NAME, "usuario"))).send_keys(USUARIO)
         driver.find_element(By.NAME, "senha").send_keys(SENHA + Keys.RETURN)
         time.sleep(5)
         print("✅ Login realizado.")
+
+        if RUN_CODES_ONLY:
+            status_final, imoveis_processados, restaurados_parte2, falhas_parte2, result_path = run_codes_cycle(
+                _parse_codes_arg(ARG_RUN_CODES)
+            )
+            _run_state_salvar(status=status_final, imoveis=imoveis_processados)
+            print(f"Relatorio da execucao controlada por codigos: {result_path}")
+            return
 
         if SINGLE_PROPERTY_CYCLE_ONLY:
             status_final, imoveis_processados, restaurados_parte2, falhas_parte2, result_path = run_single_property_cycle(
@@ -4476,7 +5032,7 @@ def main():
             # =====================================================================
             # FLUXO NORMAL: executa Parte 1
             # =====================================================================
-            if AUDIT_PORTAL_UPDATE_ONLY or AUDIT_PROPERTY_PORTAL_ONLY or TEST_CANAL_PRO_LOGIN_ONLY or HEALTHCHECK_ONLY:
+            if AUDIT_PORTAL_UPDATE_ONLY or AUDIT_PROPERTY_PORTAL_ONLY or AUDIT_CANAL_PRO_STATUS_ONLY or TEST_CANAL_PRO_LOGIN_ONLY or HEALTHCHECK_ONLY:
                 raise RuntimeError("Modo seguro bloqueado antes da Parte 1: auditoria/teste nao pode executar mutacoes.")
 
             if not go_to_imoveis_page_fresh():
@@ -4669,7 +5225,7 @@ def main():
                 and len(imoveis_processados) > 0
                 and len(imoveis_processados) < EXPECTATIVA_MINIMA_PARTE_1):
             status_notif = "WARNING_POUCOS_IMOVEIS"
-        if not (AUDIT_PORTAL_UPDATE_ONLY or AUDIT_PROPERTY_PORTAL_ONLY or TEST_CANAL_PRO_LOGIN_ONLY or RESTORE_ROLLBACK_ONLY or SINGLE_PROPERTY_CYCLE_ONLY):
+        if not (AUDIT_PORTAL_UPDATE_ONLY or AUDIT_PROPERTY_PORTAL_ONLY or AUDIT_CANAL_PRO_STATUS_ONLY or TEST_CANAL_PRO_LOGIN_ONLY or RESTORE_ROLLBACK_ONLY or SINGLE_PROPERTY_CYCLE_ONLY or RUN_CODES_ONLY):
             _enviar_notificacao_final(
                 status_notif, inicio_execucao,
                 len(imoveis_processados), len(restaurados_parte2),
