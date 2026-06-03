@@ -5235,6 +5235,15 @@ def main():
         _selftest_parte_intermediaria()
         return
 
+    if CLASSIFY_PROPERTY_STATE_ONLY:
+        os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+        os.makedirs("logs", exist_ok=True)
+        report_path, allowlist_path, _ = classify_property_state(ARG_CRM_REPORT, ARG_CANAL_REPORT)
+        _run_state_salvar(status="CLASSIFY_PROPERTY_STATE_OK", imoveis=[])
+        print(f"Relatorio cruzado: {report_path}")
+        print(f"Allowlist: {allowlist_path}")
+        return
+
     options = Options()
     if AUDIT_PORTAL_UPDATE_ONLY or RUN_CODES_ONLY or SINGLE_PROPERTY_CYCLE_ONLY:
         options.set_capability("goog:loggingPrefs", {"performance": "ALL", "browser": "ALL"})
@@ -5331,14 +5340,6 @@ def main():
             _run_state_salvar(status=status_final, imoveis=[])
             print(f"Auditoria Canal Pro concluida sem executar Parte 1/Parte 2: {report_path}")
             print(f"Evidencias: {evidence_dir}")
-            return
-
-        if CLASSIFY_PROPERTY_STATE_ONLY:
-            report_path, allowlist_path, _ = classify_property_state(ARG_CRM_REPORT, ARG_CANAL_REPORT)
-            status_final = "CLASSIFY_PROPERTY_STATE_OK"
-            _run_state_salvar(status=status_final, imoveis=[])
-            print(f"Relatorio cruzado: {report_path}")
-            print(f"Allowlist: {allowlist_path}")
             return
 
         # --- LOGIN CRM ---
@@ -5444,7 +5445,7 @@ def main():
             # =====================================================================
             # FLUXO NORMAL: executa Parte 1
             # =====================================================================
-            if AUDIT_PORTAL_UPDATE_ONLY or AUDIT_PROPERTY_PORTAL_ONLY or AUDIT_CANAL_PRO_STATUS_ONLY or TEST_CANAL_PRO_LOGIN_ONLY or HEALTHCHECK_ONLY:
+            if AUDIT_PORTAL_UPDATE_ONLY or AUDIT_PROPERTY_PORTAL_ONLY or AUDIT_CANAL_PRO_STATUS_ONLY or TEST_CANAL_PRO_LOGIN_ONLY or HEALTHCHECK_ONLY or CLASSIFY_PROPERTY_STATE_ONLY:
                 raise RuntimeError("Modo seguro bloqueado antes da Parte 1: auditoria/teste nao pode executar mutacoes.")
 
             if not go_to_imoveis_page_fresh():
@@ -5637,7 +5638,7 @@ def main():
                 and len(imoveis_processados) > 0
                 and len(imoveis_processados) < EXPECTATIVA_MINIMA_PARTE_1):
             status_notif = "WARNING_POUCOS_IMOVEIS"
-        if not (AUDIT_PORTAL_UPDATE_ONLY or AUDIT_PROPERTY_PORTAL_ONLY or AUDIT_CANAL_PRO_STATUS_ONLY or TEST_CANAL_PRO_LOGIN_ONLY or RESTORE_ROLLBACK_ONLY or SINGLE_PROPERTY_CYCLE_ONLY or RUN_CODES_ONLY):
+        if not (AUDIT_PORTAL_UPDATE_ONLY or AUDIT_PROPERTY_PORTAL_ONLY or AUDIT_CANAL_PRO_STATUS_ONLY or TEST_CANAL_PRO_LOGIN_ONLY or CLASSIFY_PROPERTY_STATE_ONLY or RESTORE_ROLLBACK_ONLY or SINGLE_PROPERTY_CYCLE_ONLY or RUN_CODES_ONLY):
             _enviar_notificacao_final(
                 status_notif, inicio_execucao,
                 len(imoveis_processados), len(restaurados_parte2),
